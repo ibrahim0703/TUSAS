@@ -2,10 +2,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # --- 1. SİMÜLASYON PARAMETRELERİ ---
-DURATION = 100 # iteration
+DURATION = 500 # iteration
 DT = 1  # step size
 TRUE_MASS = 130  # gerçek ağırlık
-START_MASS = 140  # başlangıç ağırlık tahmini
+START_MASS = 150  # başlangıç ağırlık tahmini
 
 # Sensör Hatası
 MASS_PRED_NOISE_STD = 5  # GPS ne kadar titriyor? (Standart sapma - Metre)
@@ -77,7 +77,7 @@ current_ins_pos = START_MASS
 
 # Kalman Başlat
 
-kf = SimpleKalmanFilter(initial_m = START_MASS, process_noise = 0, measure_noise = MASS_PRED_NOISE_STD ** 2, p0 = 0.1)
+kf = SimpleKalmanFilter(initial_m = START_MASS, process_noise = 0, measure_noise = MASS_PRED_NOISE_STD ** 2, p0 = 2)
 
 print("Simülasyon Başlıyor...")
 
@@ -88,7 +88,7 @@ for t in time_steps:
     # 1. TARTI AĞIRLIĞINA: Gerçek konuma rastgele hata ekle
     z_tartı = current_true_pos + np.random.normal(0, MASS_PRED_NOISE_STD)
 
-
+    current_ins_pos = current_ins_pos
     # C. KALMAN FİLTRESİ
     kf.predict()  # Önce tahmin et bişey değişmez tartı değeri hep aynı model m = m.
     est_pos = kf.update(z_tartı)  # Sonra tartı ölçümüyle düzelt.
@@ -104,13 +104,13 @@ plt.figure(figsize=(12, 6))
 
 # Hatayı görmek için 'Gerçek Konum'dan farklarını çizelim (Daha çarpıcı olur)
 plt.plot(time_steps, np.array(tartı_measurements) - np.array(true_pos),
-         'g.', alpha=0.3, label='GPS Ölçümü (Gürültülü)')
+         'g.', alpha=0.3, label='Tartı_mesurements')
 
 plt.plot(time_steps, np.array(current_mass) - np.array(true_pos),
-         'r--', linewidth=2, label='Sadece INS (Zamanla Sapar!)')
+         'r--', linewidth=2, label='Initial_deviation')
 
 plt.plot(time_steps, np.array(kalman_estimates) - np.array(true_pos),
-         'b-', linewidth=3, label='Kalman Filtresi (EGI)')
+         'b-', linewidth=3, label='Kalman Filtresi')
 
 plt.title('Hata Analizi: Kalman Filtresi vs Tek Başına Sensörler')
 plt.xlabel('Zaman (saniye)')
