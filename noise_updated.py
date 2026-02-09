@@ -183,3 +183,49 @@ plt.legend()
 plt.grid()
 
 plt.show()
+# ==========================================
+# 4. HATA ANALİZİ (GERÇEK MÜHENDİSLİK)
+# ==========================================
+
+# Euclidean Distance (Toplam Konum Hatası) Hesaplama
+# Hata = sqrt((x_tahmin - x_gercek)^2 + (y_tahmin - y_gercek)^2)
+err_kf1 = np.sqrt(np.sum((res_kf1[:,0:2] - true_pos[:,0:2])**2, axis=1))
+err_kf2 = np.sqrt(np.sum((res_kf2[:,0:2] - true_pos[:,0:2])**2, axis=1))
+err_kf3 = np.sqrt(np.sum((res_kf3[:,0:2] - true_pos[:,0:2])**2, axis=1))
+
+t = np.arange(0, total_steps * dt, dt)
+
+plt.figure(figsize=(12, 10))
+
+# --- GRAFİK 1: TOPLAM KONUM HATASI (Ne kadar saptım?) ---
+plt.subplot(3, 1, 1)
+plt.plot(t, err_kf1, 'r-', linewidth=2, label='KF1: Sadece Odo (Drift)')
+plt.plot(t, err_kf3, 'b-', linewidth=1, label='KF3: Hybrid (Testere Dişi)')
+plt.plot(t, err_kf2, 'g-', linewidth=1, alpha=0.7, label='KF2: Full GPS (Noise)')
+plt.title('Toplam Konum Hatası (Metre)')
+plt.ylabel('Hata (m)')
+plt.legend()
+plt.grid(True, which='both', linestyle='--')
+
+# --- GRAFİK 2: KF3 DETAY (Hybrid Sistemin Davranışı) ---
+# Burada Testere Dişi (Sawtooth) desenini net görmelisin
+plt.subplot(3, 1, 2)
+plt.plot(t, err_kf3, 'b.-', markersize=3, label='KF3 Hata Detayı')
+plt.title('KF3 Detay: Sürüklenme ve Düzeltme (Drift & Correction)')
+plt.ylabel('Hata (m)')
+plt.grid(True, which='both', linestyle='--')
+
+# --- GRAFİK 3: X EKSENİ HATASI (Lag ve Bias Kontrolü) ---
+# Sıfırın etrafında mı titreşiyor yoksa kayıyor mu?
+err_x_kf2 = res_kf2[:,0] - true_pos[:,0]
+plt.subplot(3, 1, 3)
+plt.plot(t, err_x_kf2, 'g-', label='KF2 (GPS) X Hatası')
+plt.axhline(0, color='k', linestyle='-', linewidth=2) # Sıfır çizgisi
+plt.title('KF2 Gürültü Analizi (Sıfır Etrafında Titreşim)')
+plt.ylabel('X Hatası (m)')
+plt.xlabel('Zaman (saniye)')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
