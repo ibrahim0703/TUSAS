@@ -1,132 +1,99 @@
 import numpy as np
 import cv2 as cv
-import matplotlib.pyplot as plt
 
-# ==========================================
-# AYARLAR
-# ==========================================
-video_path = 'araba_videosu.mp4'
-MAGIC_MULTIPLIER = 30.0 
+# --- AYARLAR ---
+video_path = 'drone_video.mp4' # İndirdiğin videonun adı
+# Drone kamerasının yeri ne kadar hızlı taradığını anlamak için katsayı
+# Bunu videoya göre deneme-yanılma ile bulacağız (Kalibrasyon)
+SCALE_FACTOR = 1.0 
 
-# --- YENİ AYAR: TİTREŞİM FİLTRESİ ---
-# Eğer bir nokta 2 pikselden az hareket ettiyse onu "Gürültü" sayıp atacağız.
-MIN_PIXEL_MOVE = 2.0 
-
-# ==========================================
-# FONKSİYONLAR
-# ==========================================
-def get_roi_mask(frame):
+def select_grid_points(frame, step=20):
+    """
+    Ekrana eşit aralıklarla (Grid) nokta döşer.
+    Shi-Tomasi yerine bunu kullanıyoruz çünkü zemin her yerde aynıdır.
+    """
     h, w = frame.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    
-    # --- DÜZELTME: KAPUTU TAMAMEN AT ---
-    # Alt sınırı 0.95'ten 0.80'e çektim. Kaput artık kadraja giremez.
-    pts = np.array([
-        [int(w * 0.10), int(h * 0.80)],  # Sol Alt (Daha yukarıda)
-        [int(w * 0.35), int(h * 0.45)],  # Sol Üst
-        [int(w * 0.65), int(h * 0.45)],  # Sağ Üst
-        [int(w * 0.90), int(h * 0.80)]   # Sağ Alt (Daha yukarıda)
-    ], dtype=np.int32).reshape((-1, 1, 2))
-    
-    cv.fillPoly(mask, [pts], 255)
-    return mask, pts
+    y, x = np.mgrid[step/2:h:step, step/2:w:step].reshape(2,-1).astype(int)
+    return np.array(list(zip(x, y)), dtype=np.float32).reshape(-1, 1, 2)
 
-# ==========================================
-# ANA KOD
-# ==========================================
 cap = cv.VideoCapture(video_path)
-feature_params = dict(maxCorners=300, qualityLevel=0.05, minDistance=5, blockSize=7)
-lk_params = dict(winSize=(21, 21), maxLevel=3, criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01))
+
+# Parametreler (Daha hassas)
+lk_params = dict(winSize=(15, 15), maxLevel=2, criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 10, 0.03))
 
 ret, old_frame = cap.read()
 if not ret: exit()
 
 old_gray = cv.cvtColor(old_frame, cv.COLOR_BGR2GRAY)
-roi_mask, roi_pts = get_roi_mask(old_frame)
-p0 = cv.goodFeaturesToTrack(old_gray, mask=roi_mask, **feature_params)
 
-est_speed = []
+# İlk noktaları GRID olarak al
+p0 = select_grid_points(old_gray, step=30) # 30 pikselde bir nokta koy
 
-print("Filtreli Analiz Başladı...")
+print("Drone Vision Başlatıldı...")
 
-try:
-    while True:
-        ret, frame = cap.read()
-        if not ret: break
-        vis_frame = frame.copy()
-        frame_gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+while True:
+    ret, frame = cap.read()
+    if not ret: break
+    vis_frame = frame.copy()
+    frame_gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+
+    # 1. NOKTA KONTROLÜ (Sürekli Grid Yenileme)
+    # Drone hareket ettikçe noktalar ekrandan çıkar, yenilerini ekle.
+    if p0 is None or len(p0) < 50:
+        p0 = select_grid_points(frame_gray, step=30)
+        old_gray = frame_gray.copy()
+        continue
+
+    # 2. OPTICAL FLOW
+    p1, st, err = cv.calcOpticalFlowPyrLK(old_gray, frame_gray, p0, None, **lk_params)
+
+    if p1 is not None:
+        good_new = p1[st==1]
+        good_old = p0[st==1]
         
-        # Sarı ROI'yi Çiz (Kontrol et, kaputun üstünde mi?)
-        cv.polylines(vis_frame, [roi_pts], True, (0, 255, 255), 2)
+        # Hareket Vektörleri
+        displacement = good_new - good_old
+        dx = displacement[:, 0]
+        dy = displacement[:, 1]
+        
+        # 3. HIZ HESABI (Drone Mantığı)
+        # Tüm ekranın ortalama hareketini al (Global Motion)
+        # RANSAC yerine basit ortalama veya medyan yeterlidir çünkü 
+        # aşağı bakarken tüm ekran aynı yöne akar (araba gibi değil).
+        vx_pixel = np.median(dx)
+        vy_pixel = np.median(dy)
+        
+        # Gürültü Filtresi (Titreşim)
+        if abs(vx_pixel) < 0.5: vx_pixel = 0
+        if abs(vy_pixel) < 0.5: vy_pixel = 0
+        
+        # Piksel Hızını Göster
+        cv.putText(vis_frame, f"Vx: {vx_pixel:.2f} px", (20, 40), cv.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv.putText(vis_frame, f"Vy: {vy_pixel:.2f} px", (20, 80), cv.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        if p0 is None or len(p0) < 10:
-            p0 = cv.goodFeaturesToTrack(frame_gray, mask=roi_mask, **feature_params)
-            old_gray = frame_gray.copy()
-            est_speed.append(0)
-            cv.imshow('Filtered Vision', vis_frame)
-            if cv.waitKey(1) & 0xff == 27: break
-            continue
+        # 4. GÖRSELLEŞTİRME (Akış Yönü)
+        # Ekranın ortasından hareket yönüne bir ok çiz
+        h, w = frame.shape[:2]
+        center = (w//2, h//2)
+        # Eksi ile çarpıyoruz çünkü zemin sola kayıyorsa drone sağa gidiyordur.
+        end_point = (int(center[0] - vx_pixel*10), int(center[1] - vy_pixel*10))
+        
+        cv.arrowedLine(vis_frame, center, end_point, (0, 0, 255), 5)
+        
+        # Grid noktalarını çiz
+        for new in good_new:
+            a, b = new.ravel()
+            cv.circle(vis_frame, (int(a), int(b)), 2, (0, 255, 0), -1)
 
-        p1, st, err = cv.calcOpticalFlowPyrLK(old_gray, frame_gray, p0, None, **lk_params)
+        old_gray = frame_gray.copy()
+        p0 = good_new.reshape(-1, 1, 2)
+    else:
+        # Takip koparsa resetle
+        p0 = select_grid_points(frame_gray, step=30)
+        old_gray = frame_gray.copy()
 
-        if p1 is not None:
-            good_new = p1[st==1]
-            good_old = p0[st==1]
-            
-            # --- KRİTİK FİLTRELEME ADIMI ---
-            clean_vectors = []
-            
-            for i, (new, old) in enumerate(zip(good_new, good_old)):
-                dx = new[0] - old[0]
-                dy = new[1] - old[1]
-                
-                # 1. TİTREŞİM KONTROLÜ (Magnitude Check)
-                magnitude = np.sqrt(dx**2 + dy**2)
-                if magnitude < MIN_PIXEL_MOVE:
-                    # Bu nokta titreşimdir, çizme ve hesaba katma
-                    continue 
+    cv.imshow('Drone Optical Flow', vis_frame)
+    if cv.waitKey(30) & 0xff == 27: break
 
-                # 2. YÖN KONTROLÜ (Direction Check)
-                # Yol aşağı (pozitif y) akar. Yukarı gidenleri (negatif y) at.
-                # Yanlara aşırı gidenleri (arabalar) at.
-                if dy < 0.5: continue # Geriye gitme veya durma
-                if abs(dx) > abs(dy): continue # Yanal hareket dikeyden fazlaysa (Yanından geçen araba)
-
-                # Eğer buraya geldiyse bu SAĞLAM bir vektördür
-                clean_vectors.append(dy)
-                
-                # Görselleştir (Sadece sağlamları yeşil çiz)
-                a, b = new.ravel()
-                c, d = old.ravel()
-                cv.arrowedLine(vis_frame, (int(c), int(d)), (int(c), int(d+dy*5)), (0, 255, 0), 2)
-
-            # --- HIZ HESABI ---
-            if len(clean_vectors) > 0:
-                avg_dy = np.mean(clean_vectors)
-                v_current = avg_dy * MAGIC_MULTIPLIER
-            else:
-                v_current = 0.0 # Hiç sağlam vektör yoksa DURUYORUZ
-
-            est_speed.append(v_current)
-
-            cv.putText(vis_frame, f"Hiz: {v_current:.2f}", (30, 50), cv.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-            cv.putText(vis_frame, f"Aktif Vektor: {len(clean_vectors)}", (30, 100), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-
-            old_gray = frame_gray.copy()
-            p0 = good_new.reshape(-1, 1, 2)
-        else:
-            est_speed.append(0)
-
-        cv.imshow('Filtered Vision', vis_frame)
-        if cv.waitKey(1) & 0xff == 27: break
-
-except Exception as e:
-    print(e)
-finally:
-    cap.release()
-    cv.destroyAllWindows()
-
-# Grafik
-plt.plot(est_speed)
-plt.title("Filtrelenmiş Hız")
-plt.show()
+cap.release()
+cv.destroyAllWindows()
