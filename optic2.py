@@ -3,179 +3,215 @@ import cv2 as cv
 import matplotlib.pyplot as plt
 
 # ==========================================
-# 1. AYARLAR
+# 1. AYARLAR (DOSYA İSİMLERİNİ KONTROL ET)
 # ==========================================
-video_path = 'araba_videosu.mp4'       # Videonun adı
-ground_truth_path = 'hiz_verisi.txt'   # Elindeki 10000x1'lik veri dosyası
-GT_FREQ = 20.0                         # Verinin frekansı (Sen 20 Hz dedin)
+video_path = 'araba_videosu.mp4'       # Senin video dosyan
+ground_truth_path = 'hiz_verisi.txt'   # Senin hız verisi dosyan
+GT_FREQ = 20.0                         # Hız verisinin frekansı (20 Hz demiştin)
 
-# Fiziksel Parametreler (Başlangıç Tahmini)
-# Not: Kodun sonunda "Önerilen Katsayı"yı görünce burayı güncelleyeceksin.
-FOCAL_LENGTH = 900.0 
+# Başlangıç Fiziksel Tahminleri (Kod sonunda otomatik düzelecek)
+FOCAL_LENGTH = 1000.0 
 HEIGHT_Z = 1.5       
-PIXEL_TO_METRIC = HEIGHT_Z / (FOCAL_LENGTH * (1/30.0)) # Başlangıç varsayımı
+# ==========================================
+
+def get_roi_mask(frame):
+    """
+    Görüntünün sadece YOL kısmını alan maske.
+    Kaputu ve Gökyüzünü kör eder.
+    """
+    h, w = frame.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    
+    # --- MASKE AYARLARI (Gerekirse burayı videona göre oynarsın) ---
+    # Yamuk (Trapezoid) şeklinde bir alan belirliyoruz.
+    pts = np.array([[
+        (int(w * 0.1), int(h * 0.90)),  # Sol Alt (Kaputun hemen üstü)
+        (int(w * 0.35), int(h * 0.45)), # Sol Üst (Ufuk çizgisi altı)
+        (int(w * 0.65), int(h * 0.45)), # Sağ Üst
+        (int(w * 0.9), int(h * 0.90))   # Sağ Alt
+    ]], dtype=np.int32)
+    
+    cv.fillPoly(mask, [pts], 255)
+    return mask, pts
 
 # ==========================================
-# 2. GERÇEK VERİYİ YÜKLE
+# 2. VERİ YÜKLEME VE HAZIRLIK
 # ==========================================
 print("Ground Truth verisi yükleniyor...")
 try:
     gt_speed = np.loadtxt(ground_truth_path)
-    # Eğer veri tek satırsa veya şekli bozuksa düzelt
-    gt_speed = gt_speed.reshape(-1) 
-    print(f"-> {len(gt_speed)} adet veri noktası yüklendi.")
+    gt_speed = gt_speed.reshape(-1) # Tek boyutlu hale getir
+    gt_time = np.arange(len(gt_speed)) / GT_FREQ
+    print(f"-> {len(gt_speed)} veri noktası yüklendi.")
 except Exception as e:
-    print(f"HATA: Veri dosyası okunamadı! ({e})")
+    print(f"HATA: Veri dosyası okunamadı! {e}")
     exit()
 
-# Gerçek verinin zaman eksenini oluştur
-gt_time = np.arange(len(gt_speed)) / GT_FREQ
-
-# ==========================================
-# 3. VİDEO İŞLEME VE HIZ TAHMİNİ
-# ==========================================
 cap = cv.VideoCapture(video_path)
 VIDEO_FPS = cap.get(cv.CAP_PROP_FPS)
-if VIDEO_FPS == 0: VIDEO_FPS = 30.0 # Hata olursa varsayılan
+if VIDEO_FPS == 0: VIDEO_FPS = 30.0
 DT = 1.0 / VIDEO_FPS
 
-# Dönüşüm katsayısını gerçek FPS ile güncelle
+# İlk Dönüşüm Katsayısı
 PIXEL_TO_METRIC = HEIGHT_Z / (FOCAL_LENGTH * DT)
 
-print(f"Video Analizi Başlıyor... FPS: {VIDEO_FPS:.2f}")
-
+# ==========================================
+# 3. ANA DÖNGÜ (OPTICAL FLOW)
+# ==========================================
 # Parametreler
-feature_params = dict(maxCorners=200, qualityLevel=0.3, minDistance=7, blockSize=7)
+feature_params = dict(maxCorners=150, qualityLevel=0.2, minDistance=7, blockSize=7)
 lk_params = dict(winSize=(21, 21), maxLevel=3, criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01))
 
 ret, old_frame = cap.read()
 if not ret: exit()
+
 old_gray = cv.cvtColor(old_frame, cv.COLOR_BGR2GRAY)
-p0 = cv.goodFeaturesToTrack(old_gray, mask=None, **feature_params)
+roi_mask, roi_pts = get_roi_mask(old_frame) # İLK MASKELEME
 
-est_speed = [] # Tahmin ettiğimiz hızları buraya atacağız
+# Sadece maskelenmiş alanda nokta bul
+p0 = cv.goodFeaturesToTrack(old_gray, mask=roi_mask, **feature_params)
 
-frame_idx = 0
+est_speed = []
+mask_vis = np.zeros_like(old_frame)
+
+print(f"Analiz Başladı... FPS: {VIDEO_FPS:.2f}")
+print("Çıkmak için pencereye tıklayıp 'ESC' tuşuna bas.")
+
 while True:
     ret, frame = cap.read()
     if not ret: break
     frame_gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+    
+    # Görselleştirme için temiz kopya
+    vis_frame = frame.copy()
 
-    # Nokta Yenileme
+    # --- NOKTA YENİLEME (Kritik Bölüm) ---
+    # Eğer nokta sayısı azalırsa, yine SADECE ROI İÇİNDE yeni nokta bul
     if p0 is None or len(p0) < 50:
-        p0 = cv.goodFeaturesToTrack(frame_gray, mask=None, **feature_params)
+        p0 = cv.goodFeaturesToTrack(frame_gray, mask=roi_mask, **feature_params)
         old_gray = frame_gray.copy()
-        est_speed.append(0) # Veri yoksa 0 bas
-        frame_idx += 1
+        est_speed.append(est_speed[-1] if est_speed else 0) # Önceki hızı koru
         continue
 
-    # Optik Akış
+    # --- OPTICAL FLOW ---
     p1, st, err = cv.calcOpticalFlowPyrLK(old_gray, frame_gray, p0, None, **lk_params)
 
     if p1 is not None:
         good_new = p1[st==1]
         good_old = p0[st==1]
         
+        # Hareket Vektörleri
         displacement = good_new - good_old
-        dy = displacement[:, 1]
+        dy = displacement[:, 1] # Dikey hareket (Yolu takip ediyoruz)
         
-        # --- RANSAC / IQR FİLTRESİ ---
+        # --- FILTRELEME (IQR / RANSAC Mantığı) ---
         if len(dy) > 0:
             q75, q25 = np.percentile(dy, [75 ,25])
             iqr = q75 - q25
             lower = q25 - (1.5 * iqr)
             upper = q75 + (1.5 * iqr)
+            
+            # Sadece güvenilir vektörleri al
             clean_dy = dy[(dy >= lower) & (dy <= upper)]
             
             if len(clean_dy) > 0:
-                px_speed = np.mean(clean_dy)
+                avg_dy = np.mean(clean_dy)
             else:
-                px_speed = 0
+                avg_dy = 0
         else:
-            px_speed = 0
+            avg_dy = 0
             
-        # Hız Dönüşümü (- çünkü dünya aşağı akar)
-        # Sadece pozitif (ileri) hızları alalım, geri gitme yok varsayalım
-        v_mps = max(0, -px_speed * PIXEL_TO_METRIC)
-        est_speed.append(v_mps)
+        # Hız Hesabı (Magnitude)
+        # Genelde yol aşağı (pozitif) akar, biz ileri gideriz. Mutlak değer alıp çarpıyoruz.
+        v_current = abs(avg_dy) * PIXEL_TO_METRIC
+        est_speed.append(v_current)
+
+        # --- GÖRSELLEŞTİRME ---
+        # 1. ROI Alanını Çiz (Sarı)
+        cv.polylines(vis_frame, [roi_pts], True, (0, 255, 255), 2)
+        
+        # 2. Vektörleri Çiz
+        for i, (new, old) in enumerate(zip(good_new, good_old)):
+            a, b = new.ravel()
+            c, d = old.ravel()
+            
+            # Outlier ise Kırmızı, Temiz ise Yeşil
+            curr_dy = new[1] - old[1]
+            if lower <= curr_dy <= upper:
+                color = (0, 255, 0) # Yeşil (İyi)
+            else:
+                color = (0, 0, 255) # Kırmızı (Gürültü)
+                
+            vis_frame = cv.line(vis_frame, (int(a), int(b)), (int(c), int(d)), color, 2)
+            vis_frame = cv.circle(vis_frame, (int(a), int(b)), 3, color, -1)
+            
+        cv.putText(vis_frame, f"Tahmini Hiz: {v_current:.2f} m/s", (30, 50), cv.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
         old_gray = frame_gray.copy()
         p0 = good_new.reshape(-1, 1, 2)
     else:
         est_speed.append(0)
-        
-    frame_idx += 1
-    # İlerlemeyi göster
-    if frame_idx % 100 == 0: print(f"İşlenen Kare: {frame_idx}")
+
+    cv.imshow('TUSAS Vision Odometry (ROI Fixed)', vis_frame)
+    
+    k = cv.waitKey(1) & 0xff
+    if k == 27: break
 
 cap.release()
-print("Video bitti.")
+cv.destroyAllWindows()
 
 # ==========================================
-# 4. SENKRONİZASYON VE ANALİZ
+# 4. SONUÇ VE KALİBRASYON ANALİZİ
 # ==========================================
 est_speed = np.array(est_speed)
-est_time = np.arange(len(est_speed)) / VIDEO_FPS # Videonun zaman ekseni
+est_time = np.arange(len(est_speed)) / VIDEO_FPS
 
-# Sorun: Video ve Veri süreleri tutmuyor olabilir.
-# Çözüm: Video süresi kadar olan kısmı karşılaştıralım.
-min_time = min(gt_time[-1], est_time[-1])
+# Zaman eşitleme (Kırpma)
+min_t = min(gt_time[-1], est_time[-1])
+mask_gt = gt_time <= min_t
+mask_est = est_time <= min_t
 
-# Sadece ortak zaman dilimindeki verileri al
-gt_valid_mask = gt_time <= min_time
-est_valid_mask = est_time <= min_time
+gt_t_crop = gt_time[mask_gt]
+gt_v_crop = gt_speed[mask_gt]
+est_t_crop = est_time[mask_est]
+est_v_crop = est_speed[mask_est]
 
-gt_time_crop = gt_time[gt_valid_mask]
-gt_speed_crop = gt_speed[gt_valid_mask]
+# Interpolasyon (Zamanları çakıştır)
+est_v_interp = np.interp(gt_t_crop, est_t_crop, est_v_crop)
 
-est_time_crop = est_time[est_valid_mask]
-est_speed_crop = est_speed[est_valid_mask]
-
-# --- KRİTİK ADIM: Estimasyon verisini GT zamanlarına İnterpole et (Eşitle) ---
-# Böylece RMSE hesaplayabiliriz
-est_speed_interp = np.interp(gt_time_crop, est_time_crop, est_speed_crop)
-
-# --- KALİBRASYON KATSAYISI HESABI ---
-# Bizim verimiz ile gerçek veri arasında sadece "Büyüklük" farkı varsa bunu bulalım.
-# Scale Factor = mean(GT) / mean(Est)
-if np.mean(est_speed_interp) > 0.1: # Sıfıra bölmeyi engelle
-    scale_factor = np.mean(gt_speed_crop) / np.mean(est_speed_interp)
+# SCALE FACTOR HESABI
+if np.mean(est_v_interp) > 0.1:
+    scale_factor = np.mean(gt_v_crop) / np.mean(est_v_interp)
 else:
     scale_factor = 1.0
 
-print(f"\n=== SONUÇ RAPORU ===")
-print(f"Önerilen Ölçek Çarpanı (Scale Factor): {scale_factor:.4f}")
-print(f"-> Eğer bu sayı 1'den çok farklıysa, FOCAL_LENGTH değerini buna göre güncellemelisin.")
-print(f"-> Yeni FOCAL_LENGTH = Mevcut ({FOCAL_LENGTH}) / {scale_factor:.4f}")
+# Kalibre edilmiş hız
+est_v_calibrated = est_v_interp * scale_factor
+rmse = np.sqrt(np.mean((gt_v_crop - est_v_calibrated)**2))
 
-# Kalibre edilmiş tahmin (Grafik için)
-est_speed_calibrated = est_speed_interp * scale_factor
+print("\n" + "="*40)
+print(f"ANALİZ SONUCU (ROI DÜZELTMESİ SONRASI)")
+print("="*40)
+print(f"Hesaplanan Scale Factor: {scale_factor:.4f}")
+print(f"Kalibre Edilmiş Hata (RMSE): {rmse:.2f} m/s")
+print("="*40)
 
-# Hata Hesabı (RMSE)
-rmse = np.sqrt(np.mean((gt_speed_crop - est_speed_calibrated)**2))
-print(f"Hata (RMSE): {rmse:.2f} m/s (Kalibrasyon sonrası)")
+# GRAFİK
+plt.figure(figsize=(12, 8))
 
-# ==========================================
-# 5. GRAFİK ÇİZİMİ
-# ==========================================
-plt.figure(figsize=(14, 8))
-
-# Üst Grafik: Ham Karşılaştırma
 plt.subplot(2, 1, 1)
-plt.plot(gt_time_crop, gt_speed_crop, 'r-', label='Ground Truth (Gerçek Veri)')
-plt.plot(est_time_crop, est_speed_crop, 'b--', alpha=0.7, label='Senin Kodun (Ham)')
-plt.title(f"Ham Veri Karşılaştırması (Scale Factor Öncesi)")
-plt.ylabel("Hız (m/s)")
+plt.plot(gt_t_crop, gt_v_crop, 'r-', label='Ground Truth')
+plt.plot(est_t_crop, est_v_crop, 'b--', alpha=0.6, label='Senin Kodun (Ham)')
+plt.title('Ham Veri (Scale Edilmemiş)')
 plt.legend()
 plt.grid()
 
-# Alt Grafik: Kalibre Edilmiş Karşılaştırma
 plt.subplot(2, 1, 2)
-plt.plot(gt_time_crop, gt_speed_crop, 'r-', linewidth=2, label='Ground Truth')
-plt.plot(gt_time_crop, est_speed_calibrated, 'g-', alpha=0.8, linewidth=1.5, label='Senin Kodun (Kalibre Edilmiş)')
-plt.title(f"Kalibre Edilmiş Karşılaştırma (RMSE: {rmse:.2f} m/s)")
-plt.xlabel("Zaman (saniye)")
-plt.ylabel("Hız (m/s)")
+plt.plot(gt_t_crop, gt_v_crop, 'r-', linewidth=2, label='Ground Truth')
+plt.plot(gt_t_crop, est_v_calibrated, 'g-', linewidth=1.5, label='Senin Kodun (Kalibre)')
+plt.title(f'KALİBRE EDİLMİŞ SONUÇ (RMSE: {rmse:.2f})')
+plt.xlabel('Zaman (sn)')
+plt.ylabel('Hız (m/s)')
 plt.legend()
 plt.grid()
 
