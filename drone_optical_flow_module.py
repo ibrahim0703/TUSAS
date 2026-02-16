@@ -6,7 +6,7 @@ import cv2 as cv
 # =============================================================================
 # Sistem Parametreleri (GNC - Guidance Navigation Control)
 CONFIG = {
-    'VIDEO_SOURCE': '282749_medium.mp4',  # Test videosu
+    'VIDEO_SOURCE': r'C:/Users/A12540/Desktop/a/test.mp4',  # Test videosu
     'SCALE_FACTOR': 0.5,  # İşlem yükünü azaltmak için küçültme oranı
     'FOCAL_LENGTH_PX': 800.0,  # Kamera Kalibrasyon Matrisi (fx)
     'DT': 1.0 / 30.0,  # Döngü süresi (30 FPS varsayımı)
@@ -98,10 +98,18 @@ def compensated_flow_to_metric_velocity(flow_px, agl, focal_len, dt, gyro):
 def main():
     # 1. Sistem Başlatma
     cap = cv.VideoCapture(CONFIG['VIDEO_SOURCE'])
+    if not cap.isOpened():
+        print("!!! KRİTİK HATA !!!")
+        print(f"Video dosyası açılamadı: {CONFIG['VIDEO_SOURCE']}")
+        print("Lütfen dosya ismini kontrol et veya tam yol (C:/...) kullan.")
+        return
+
     sensors = DroneSensorInterface()
 
     ret, old_frame = cap.read()
-    if not ret: return
+    if not ret: 
+        print("!!! HATA !!! Video açıldı ama ilk kare okunamadı.")
+        return
 
     # Ön İşleme
     old_frame = cv.resize(old_frame, None, fx=CONFIG['SCALE_FACTOR'], fy=CONFIG['SCALE_FACTOR'])
