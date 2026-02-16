@@ -1,99 +1,106 @@
-import numpy as np
-import cv2 as cv
+def main():
+    # 1. Sistem Başlatma
+    print(f"[BASLIYOR] Video Yolu: {CONFIG['VIDEO_SOURCE']}")
+    cap = cv.VideoCapture(CONFIG['VIDEO_SOURCE'])
+    
+    if not cap.isOpened():
+        print("!!! KRİTİK HATA !!! Video açılamadı.")
+        return
 
-# --- AYARLAR ---
-video_path = 'drone_video.mp4' # İndirdiğin videonun adı
-# Drone kamerasının yeri ne kadar hızlı taradığını anlamak için katsayı
-# Bunu videoya göre deneme-yanılma ile bulacağız (Kalibrasyon)
-SCALE_FACTOR = 1.0 
+    sensors = DroneSensorInterface()
 
-def select_grid_points(frame, step=20):
-    """
-    Ekrana eşit aralıklarla (Grid) nokta döşer.
-    Shi-Tomasi yerine bunu kullanıyoruz çünkü zemin her yerde aynıdır.
-    """
-    h, w = frame.shape[:2]
-    y, x = np.mgrid[step/2:h:step, step/2:w:step].reshape(2,-1).astype(int)
-    return np.array(list(zip(x, y)), dtype=np.float32).reshape(-1, 1, 2)
+    ret, old_frame = cap.read()
+    if not ret: 
+        print("!!! HATA !!! İlk kare okunamadı.")
+        return
 
-cap = cv.VideoCapture(video_path)
+    # Ön İşleme
+    old_frame = cv.resize(old_frame, None, fx=CONFIG['SCALE_FACTOR'], fy=CONFIG['SCALE_FACTOR'])
+    old_gray = cv.cvtColor(old_frame, cv.COLOR_BGR2GRAY)
+    p0 = generate_grid_features(old_gray, step=40)
 
-# Parametreler (Daha hassas)
-lk_params = dict(winSize=(15, 15), maxLevel=2, criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 10, 0.03))
+    print("[INFO] Döngü başlıyor...")
 
-ret, old_frame = cap.read()
-if not ret: exit()
+    while True:
+        ret, frame = cap.read()
+        if not ret: 
+            print("Video bitti.")
+            break
 
-old_gray = cv.cvtColor(old_frame, cv.COLOR_BGR2GRAY)
+        telemetry = sensors.get_telemetry_packet()
+        current_agl = telemetry['lidar_agl']
+        current_gyro = telemetry['imu_gyro']
 
-# İlk noktaları GRID olarak al
-p0 = select_grid_points(old_gray, step=30) # 30 pikselde bir nokta koy
+        frame = cv.resize(frame, None, fx=CONFIG['SCALE_FACTOR'], fy=CONFIG['SCALE_FACTOR'])
+        vis_frame = frame.copy()
+        frame_gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
 
-print("Drone Vision Başlatıldı...")
+        if p0 is None or len(p0) < 50:
+            p0 = generate_grid_features(frame_gray, step=40)
+            old_gray = frame_gray.copy()
+            # BURADAKİ continue'yu KALDIRDIM, sadece frame'i güncelle
+            
+        else:
+            p1, st, err = cv.calcOpticalFlowPyrLK(old_gray, frame_gray, p0, None, **CONFIG['LK_PARAMS'])
 
-while True:
-    ret, frame = cap.read()
-    if not ret: break
-    vis_frame = frame.copy()
-    frame_gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            if p1 is not None:
+                good_new = p1[st == 1]
+                good_old = p0[st == 1]
 
-    # 1. NOKTA KONTROLÜ (Sürekli Grid Yenileme)
-    # Drone hareket ettikçe noktalar ekrandan çıkar, yenilerini ekle.
-    if p0 is None or len(p0) < 50:
-        p0 = select_grid_points(frame_gray, step=30)
-        old_gray = frame_gray.copy()
-        continue
+                # RANSAC
+                M, mask = cv.findHomography(good_old, good_new, cv.RANSAC, CONFIG['RANSAC_THRESHOLD'])
 
-    # 2. OPTICAL FLOW
-    p1, st, err = cv.calcOpticalFlowPyrLK(old_gray, frame_gray, p0, None, **lk_params)
+                if M is not None: # continue YERİNE if M is not None KULLANDIM
+                    matchesMask = mask.ravel().tolist()
 
-    if p1 is not None:
-        good_new = p1[st==1]
-        good_old = p0[st==1]
+                    inlier_vectors_x = []
+                    inlier_vectors_y = []
+
+                    for i, (new, old) in enumerate(zip(good_new, good_old)):
+                        if matchesMask[i]:
+                            dx = new[0] - old[0]
+                            dy = new[1] - old[1]
+                            inlier_vectors_x.append(dx)
+                            inlier_vectors_y.append(dy)
+                            cv.line(vis_frame, (int(new[0]), int(new[1])), (int(old[0]), int(old[1])), (0, 255, 0), 1)
+                        else:
+                            cv.circle(vis_frame, (int(new[0]), int(new[1])), 2, (0, 0, 255), -1)
+
+                    if len(inlier_vectors_x) > 0:
+                        mean_flow_x = np.mean(inlier_vectors_x)
+                        mean_flow_y = np.mean(inlier_vectors_y)
+
+                        vx_metric = compensated_flow_to_metric_velocity(mean_flow_x, current_agl, CONFIG['FOCAL_LENGTH_PX'], CONFIG['DT'], current_gyro)
+                        vy_metric = compensated_flow_to_metric_velocity(mean_flow_y, current_agl, CONFIG['FOCAL_LENGTH_PX'], CONFIG['DT'], current_gyro)
+
+                        v_forward = vy_metric
+                        v_right = vx_metric
+
+                        color_speed = (0, 255, 0) if v_forward > 0 else (0, 0, 255)
+                        cv.putText(vis_frame, f"HIZ (Ileri): {v_forward:.2f} m/s", (20, 60), cv.FONT_HERSHEY_SIMPLEX, 0.8, color_speed, 2)
+                        
+                        h, w = frame.shape[:2]
+                        center = (w // 2, h // 2)
+                        end_pt = (int(center[0] - mean_flow_x * 20), int(center[1] - mean_flow_y * 20))
+                        cv.arrowedLine(vis_frame, center, end_pt, (0, 255, 255), 4, tipLength=0.3)
+
+                    old_gray = frame_gray.copy()
+                    p0 = good_new.reshape(-1, 1, 2)
+                else:
+                     # RANSAC Çözemezse bile eski frame'i güncelle ki döngü aksın
+                     old_gray = frame_gray.copy()
+                     p0 = good_new.reshape(-1, 1, 2)
+            else:
+                 p0 = generate_grid_features(frame_gray, step=40)
+                 old_gray = frame_gray.copy()
+
+        # imshow ARTIK HER DURUMDA ÇALIŞACAK
+        cv.putText(vis_frame, f"AGL: {current_agl:.1f} m", (20, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv.imshow('TUSAS Optical Flow Module (Level 1)', vis_frame)
         
-        # Hareket Vektörleri
-        displacement = good_new - good_old
-        dx = displacement[:, 0]
-        dy = displacement[:, 1]
-        
-        # 3. HIZ HESABI (Drone Mantığı)
-        # Tüm ekranın ortalama hareketini al (Global Motion)
-        # RANSAC yerine basit ortalama veya medyan yeterlidir çünkü 
-        # aşağı bakarken tüm ekran aynı yöne akar (araba gibi değil).
-        vx_pixel = np.median(dx)
-        vy_pixel = np.median(dy)
-        
-        # Gürültü Filtresi (Titreşim)
-        if abs(vx_pixel) < 0.5: vx_pixel = 0
-        if abs(vy_pixel) < 0.5: vy_pixel = 0
-        
-        # Piksel Hızını Göster
-        cv.putText(vis_frame, f"Vx: {vx_pixel:.2f} px", (20, 40), cv.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv.putText(vis_frame, f"Vy: {vy_pixel:.2f} px", (20, 80), cv.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        if cv.waitKey(int(CONFIG['DT'] * 1000)) & 0xff == 27: 
+            print("ESC basıldı, çıkılıyor.")
+            break
 
-        # 4. GÖRSELLEŞTİRME (Akış Yönü)
-        # Ekranın ortasından hareket yönüne bir ok çiz
-        h, w = frame.shape[:2]
-        center = (w//2, h//2)
-        # Eksi ile çarpıyoruz çünkü zemin sola kayıyorsa drone sağa gidiyordur.
-        end_point = (int(center[0] - vx_pixel*10), int(center[1] - vy_pixel*10))
-        
-        cv.arrowedLine(vis_frame, center, end_point, (0, 0, 255), 5)
-        
-        # Grid noktalarını çiz
-        for new in good_new:
-            a, b = new.ravel()
-            cv.circle(vis_frame, (int(a), int(b)), 2, (0, 255, 0), -1)
-
-        old_gray = frame_gray.copy()
-        p0 = good_new.reshape(-1, 1, 2)
-    else:
-        # Takip koparsa resetle
-        p0 = select_grid_points(frame_gray, step=30)
-        old_gray = frame_gray.copy()
-
-    cv.imshow('Drone Optical Flow', vis_frame)
-    if cv.waitKey(30) & 0xff == 27: break
-
-cap.release()
-cv.destroyAllWindows()
+    cap.release()
+    cv.destroyAllWindows()
