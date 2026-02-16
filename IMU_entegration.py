@@ -4,34 +4,42 @@ import pandas as pd
 import os
 
 # =============================================================================
-# 1. KONFİGÜRASYON (LEVEL 2 AYARLARI)
+# 1. KONFİGÜRASYON
 # =============================================================================
 CONFIG = {
     # Video yolunu buraya yaz
-    'VIDEO_SOURCE': r'C:/Users/A12540/Desktop/a/test.mp4',
+    'VIDEO_SOURCE': r'C:/Users/A12540/Desktop/a/1.mp4',
     
     # Eğer elinde veri seti varsa CSV yolunu buraya yaz (Yoksa None kalsın, simüle eder)
     'IMU_CSV_PATH': None, # Örn: r'C:/Users/.../imu_data.csv'
     
-    'SCALE_FACTOR': 0.5,       
-    'FOCAL_LENGTH_PX': 800.0,  
+    'SCALE_FACTOR': 0.8,       # İşlem hızını artırmak için küçültme (0.8 = %80) # video yavaş işleniyorsa düşürebilirsin
+    'FOCAL_LENGTH_PX': 1000,  # Kamera Odak Uzaklığı (Varsayılan) # hesaplanan hız düşük kalıyorsa focal_lenght arttır deneme yanılmayla doğru piksel metre dönüşümünü bul.
     
-    # Gökyüzü Maskeleme (Ufuk çizgisi varsa 0.40 yap)
+    # --- ROI (GÖKYÜZÜ MASKELEME) ---
+    # Eğer videoda ufuk çizgisi varsa, üst kısmı kesmek için burayı artır (0.0 ile 1.0 arası)
+    # Örn: 0.40 yaparsan ekranın üst %40'ını görmezden gelir. Eğer kameram dikse bunu 0 yap direk görseli kesmeden işlem yaparız.
+    # Hız 0 çıkarsa durgun noktaları kesmek için % yi arttır. 
     'ROI_SKY_MASK_PERCENT': 0.40, 
 
-    'RANSAC_THRESHOLD': 5.0,
-    'LK_PARAMS': dict(winSize=(21, 21), maxLevel=3, criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01))
+    # --- RANSAC_THRESHOLD ---
+    'RANSAC_THRESHOLD': 5.0, # Kaç piksel saparsam noktayı referans olarak almıyım diye sorar.
+                             # Video titrek ve gürültülüyse sayıyı arttırarak daha çok noktaya bakarsın / Eğer stabil bir videoysa daha az referans noktasına bakarsın hareketlileri daha kolay elersin
+    # --- LUCAS KANDE PARAMETERS ---
+    'LK_PARAMS': dict(winSize=(21, 21), # takip yavaş kalırsa drone daha hızlıysa win_size büyüt.
+                    maxLevel=3,
+                    criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01))
 }
 
 # =============================================================================
-# 2. HİBRİT SENSÖR ARAYÜZÜ (LEVEL 2: CSV + SIMULATION)
+# 2. HİBRİT SENSÖR ARAYÜZÜ ( CSV path girersen kullanır yoksa SIMULATION yapar.)
 # =============================================================================
 class DroneSensorInterface:
     """
-    Bu sınıf artık hem Simülasyon hem de CSV okuma yeteneğine sahip.
+    Bu sınıf hem veri yoksa simülasyon  yapar hem de CSV okuma yeteneğine sahip.
     """
     def __init__(self, csv_path=None):
-        self.agl_height_meters = 20.0 
+        self.agl_height_meters = 20.0  # Drone'nın yerden yükseliğini ayarladığımız yer.
         self.use_csv = False
         self.data_idx = 0
         
@@ -98,7 +106,7 @@ def generate_grid_features(frame, step=30):
 def compensated_flow_to_metric_velocity(flow_px_total, agl, focal_len, dt, gyro_rate):
     """
     *** LEVEL 2 KRİTİK FONKSİYON ***
-    V_saf = V_gözlenen - V_dönüş
+    V_gerçek = V_gözlenen - V_dönüş
     """
     # 1. Gözlenen Toplam Hız (Piksel/Saniye)
     v_px_total_per_sec = flow_px_total / dt
@@ -108,7 +116,7 @@ def compensated_flow_to_metric_velocity(flow_px_total, agl, focal_len, dt, gyro_
     # Pitch hareketi Y ekseninde, Roll/Yaw hareketi X ekseninde kayma yapar.
     v_px_rotation = gyro_rate * focal_len
     
-    # 3. Saf İlerleme Hızı (Translation Flow)
+    # 3. Gerçek İlerleme Hızı (Translation Flow)
     v_px_translation = v_px_total_per_sec - v_px_rotation
 
     # 4. Metrik Dönüşüm (m/s)
@@ -187,7 +195,7 @@ def main():
                     old_gray = frame_gray.copy()
                     continue
 
-                # RANSAC
+                # RANSAC outliers eler sağlam olanları seçer ve tahmini yapar.
                 M, mask = cv.findHomography(good_old, good_new, cv.RANSAC, CONFIG['RANSAC_THRESHOLD'])
 
                 if M is not None:
