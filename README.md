@@ -1,22 +1,3 @@
-    # ... (Video açma kısmı) ...
-    cap = cv.VideoCapture(CONFIG['VIDEO_SOURCE'])
-    
-    if not cap.isOpened():
-        print("!!! KRİTİK HATA !!! Video açılamadı.")
-        return
-
-    # --- YENİ EKLENECEK KISIM (OTOMATİK FPS) ---
-    real_fps = cap.get(cv.CAP_PROP_FPS)
-    
-    # Bazen fps 0 veya nan dönebilir (güvenlik önlemi)
-    if real_fps > 0 and not np.isnan(real_fps):
-        CONFIG['DT'] = 1.0 / real_fps
-        print(f"[BILGI] Video FPS tespit edildi: {real_fps:.2f}")
-        print(f"[BILGI] Yeni DT (Delta Time): {CONFIG['DT']:.4f} saniye")
-    else:
-        print("[UYARI] FPS okunamadı! Varsayılan 30 FPS kullanılıyor.")
-        CONFIG['DT'] = 1.0 / 30.0
-    # -------------------------------------------
 def main():
     # 1. Sistem Başlatma
     print(f"[BASLIYOR] Video Yolu: {CONFIG['VIDEO_SOURCE']}")
@@ -53,8 +34,8 @@ def main():
         ret, frame = cap.read()
         if not ret: 
             print("Video bitti. Başa sarılıyor...")
-            cap.set(cv.CAP_PROP_POS_FRAMES, 0) # Videoyu başa sarıp sonsuz döngü yapalım
-            p0 = None # Noktaları sıfırla
+            cap.set(cv.CAP_PROP_POS_FRAMES, 0)
+            p0 = None
             continue
 
         telemetry = sensors.get_telemetry_packet()
@@ -74,6 +55,13 @@ def main():
             if p1 is not None:
                 good_new = p1[st == 1]
                 good_old = p0[st == 1]
+
+                # --- DÜZELTME BURADA: EN AZ 4 NOKTA KONTROLÜ ---
+                if len(good_old) < 4:
+                    # Yeterli nokta yoksa, gridi yenile ve bu kareyi atla
+                    p0 = generate_grid_features(frame_gray, step=40)
+                    old_gray = frame_gray.copy()
+                    continue 
 
                 # RANSAC
                 M, mask = cv.findHomography(good_old, good_new, cv.RANSAC, CONFIG['RANSAC_THRESHOLD'])
@@ -97,7 +85,6 @@ def main():
                         mean_flow_x = np.mean(inlier_vectors_x)
                         mean_flow_y = np.mean(inlier_vectors_y)
 
-                        # BURADA ARTIK OTOMATİK HESAPLANAN CONFIG['DT'] KULLANILIYOR
                         vx_metric = compensated_flow_to_metric_velocity(mean_flow_x, current_agl, CONFIG['FOCAL_LENGTH_PX'], CONFIG['DT'], current_gyro)
                         vy_metric = compensated_flow_to_metric_velocity(mean_flow_y, current_agl, CONFIG['FOCAL_LENGTH_PX'], CONFIG['DT'], current_gyro)
 
@@ -122,9 +109,8 @@ def main():
                  old_gray = frame_gray.copy()
 
         cv.putText(vis_frame, f"AGL: {current_agl:.1f} m | FPS: {real_fps:.0f}", (20, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv.imshow('TUSAS Optical Flow Module (Auto FPS)', vis_frame)
+        cv.imshow('TUSAS Optical Flow Module (Fixed)', vis_frame)
         
-        # Bekleme süresini de FPS'e göre dinamik yapıyoruz
         delay = int(1000 / real_fps) if real_fps > 0 else 30
         if cv.waitKey(delay) & 0xff == 27: 
             break
