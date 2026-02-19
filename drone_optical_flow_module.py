@@ -1,226 +1,198 @@
 import numpy as np
 import cv2 as cv
+import pandas as pd
+import os
 
 # =============================================================================
-# 1. KONFİGÜRASYON (AYARLAR)
+# 1. KONFİGÜRASYON (EuRoC MH_01_easy - Zemin Hack)
 # =============================================================================
 CONFIG = {
-    # --- VİDEO YOLU (Bunu kendi bilgisayarına göre değiştir) ---
-    'VIDEO_SOURCE': r'C:/Users/A12540/Desktop/a/test.mp4', 
-    
-    'SCALE_FACTOR': 0.5,       # İşlem hızını artırmak için küçültme (0.5 = %50)
-    'FOCAL_LENGTH_PX': 800.0,  # Kamera Odak Uzaklığı (Varsayılan)
-    
-    # --- ROI (GÖKYÜZÜ MASKELEME) ---
-    # Eğer videoda ufuk çizgisi varsa, üst kısmı kesmek için burayı artır (0.0 ile 1.0 arası)
-    # Örn: 0.40 yaparsan ekranın üst %40'ını görmezden gelir.
-    'ROI_SKY_MASK_PERCENT': 0.40, 
+    'CAM_CSV_PATH': 'cam0/data.csv',
+    'CAM_IMG_DIR': 'cam0/data',
+    'IMU_CSV_PATH': 'imu0/data.csv',
+    'GT_CSV_PATH': 'state_groundtruth_estimate0/data.csv',
 
-    # --- RANSAC & OPTICAL FLOW ---
-    'RANSAC_THRESHOLD': 5.0,   # Hata toleransı
-    'LK_PARAMS': dict(
-        winSize=(21, 21),
-        maxLevel=3,
-        criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01)
-    )
+    'FOCAL_LENGTH_PX': 458.654,  # EuRoC cam0 fx
+
+    # --- ZEMİN HACK AYARI ---
+    # Görüntünün SADECE ALT %40'ını alacağız (Zemine bakan kısım)
+    'ROI_TOP_CROP_PERCENT': 0.60,
+
+    'RANSAC_THRESHOLD': 3.0,
+    'LK_PARAMS': dict(winSize=(21, 21), maxLevel=3, criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01))
 }
 
+
 # =============================================================================
-# 2. DRONE SENSÖR ARAYÜZÜ (SIMULATED / REAL)
+# 2. EUROC DATA LOADER (Senkronizasyon Motoru)
 # =============================================================================
-class DroneSensorInterface:
-    """
-    Bu sınıf, Lidar ve IMU verilerini sağlar.
-    Şu an Simülasyon modundadır. İleride CSV okuyacak şekilde güncellenecektir.
-    """
+class EurocDataLoader:
     def __init__(self):
-        # Varsayılan yükseklik (Video analizine göre değiştirebilirsin)
-        self.agl_height_meters = 20.0 
-        self.gyro_rates_rad_s = np.array([0.0, 0.0, 0.0]) # [Roll, Pitch, Yaw] hızı
+        print("[SİSTEM] EuRoC Veri Seti Yükleniyor...")
+        self.cam_df = pd.read_csv(CONFIG['CAM_CSV_PATH'])
+        self.cam_df.columns = ['timestamp', 'filename']
 
-    def get_telemetry_packet(self):
-        """
-        Her karede çağrılır. Anlık sensör verisini döndürür.
-        """
-        # --- SİMÜLASYON KISMI ---
-        # Gerçek uçuşta burası sensörden okuyacak.
-        
-        # Hafif gürültü ekle (Gerçekçilik için)
-        noise = np.random.normal(0, 0.05)
-        current_agl = max(2.0, self.agl_height_meters + noise)
+        self.imu_df = pd.read_csv(CONFIG['IMU_CSV_PATH'])
+        self.imu_df.columns = self.imu_df.columns.str.strip()
 
-        # Dönüş verisi (Şimdilik 0 kabul ediyoruz)
-        current_gyro = np.array([0.0, 0.0, 0.0]) 
+        self.gt_df = pd.read_csv(CONFIG['GT_CSV_PATH'])
+        self.gt_df.columns = self.gt_df.columns.str.strip()
 
+        self.total_frames = len(self.cam_df)
+        self.current_idx = 0
+
+    def get_next_frame_data(self):
+        if self.current_idx >= self.total_frames - 1:
+            return None
+
+        cam_row = self.cam_df.iloc[self.current_idx]
+        t_cam = cam_row['timestamp']
+        img_name = cam_row['filename']
+        img_path = os.path.join(CONFIG['CAM_IMG_DIR'], str(img_name))
+
+        t_cam_next = self.cam_df.iloc[self.current_idx + 1]['timestamp']
+        dt_seconds = (t_cam_next - t_cam) / 1e9
+
+        frame = cv.imread(img_path, cv.IMREAD_GRAYSCALE)
+        if frame is None:
+            print(f"[HATA] Fotoğraf bulunamadı: {img_path}")
+            self.current_idx += 1
+            return self.get_next_frame_data()
+
+        # IMU Senkronizasyonu
+        imu_idx = (np.abs(self.imu_df['#timestamp [ns]'] - t_cam)).argmin()
+        imu_row = self.imu_df.iloc[imu_idx]
+        gyro_x = imu_row['w_RS_S_x [rad s^-1]']
+        gyro_y = imu_row['w_RS_S_y [rad s^-1]']
+
+        # Ground Truth Senkronizasyonu
+        gt_idx = (np.abs(self.gt_df['#timestamp'] - t_cam)).argmin()
+        gt_row = self.gt_df.iloc[gt_idx]
+        true_vx = gt_row['v_RS_R_x [m s^-1]']
+
+        # EuRoC'ta x ileri, y sol, z yukarıdır. İleri hızı alıyoruz.
+        true_vy = gt_row['v_RS_R_y [m s^-1]']
+        true_z_height = abs(gt_row['p_RS_R_z [m]'])
+
+        self.current_idx += 1
         return {
-            'lidar_agl': current_agl,  # Metre
-            'imu_gyro': current_gyro,  # Rad/s
-            'valid': True
+            'frame': frame, 'dt': dt_seconds, 'gyro': (gyro_x, gyro_y),
+            'ground_truth_v': (true_vx, true_vy), 'agl_height': true_z_height
         }
 
+
 # =============================================================================
-# 3. YARDIMCI MATEMATİK FONKSİYONLARI
+# 3. ROTATION COMPENSATION & OPTICAL FLOW
 # =============================================================================
-def generate_grid_features(frame, step=30):
-    """Ekrana eşit aralıklarla nokta döşer."""
+def generate_grid_features(frame, step=20):
     h, w = frame.shape[:2]
-    margin = int(h * 0.1)
-    y, x = np.mgrid[margin:h-margin:step, margin:w-margin:step].reshape(2, -1).astype(int)
+    y, x = np.mgrid[10:h - 10:step, 10:w - 10:step].reshape(2, -1).astype(int)
     return np.array(list(zip(x, y)), dtype=np.float32).reshape(-1, 1, 2)
 
-def compensated_flow_to_metric_velocity(flow_px, agl, focal_len, dt, gyro):
-    """
-    Piksel kaymasını (px) -> Gerçek hıza (m/s) çevirir.
-    Level 2'de buraya Gyro düzeltmesi eklenecektir.
-    """
-    # 1. Piksel Hızı (px/s)
-    v_px_per_sec = flow_px / dt
 
-    # 2. Metrik Hız (m/s) - Pinhole Model
-    # V = (v_px * H) / f
-    v_metric = (v_px_per_sec * agl) / focal_len
-
-    return v_metric
-
-# =============================================================================
-# 4. ANA PROGRAM (MAIN LOOP)
-# =============================================================================
 def main():
-    print(f"[BAŞLATILIYOR] Video: {CONFIG['VIDEO_SOURCE']}")
-    
-    # Videoyu Aç
-    cap = cv.VideoCapture(CONFIG['VIDEO_SOURCE'])
-    if not cap.isOpened():
-        print("!!! KRİTİK HATA !!! Video dosyası bulunamadı/açılamadı.")
-        return
+    dataset = EurocDataLoader()
+    data = dataset.get_next_frame_data()
+    if data is None: return
 
-    # Otomatik FPS Algılama
-    real_fps = cap.get(cv.CAP_PROP_FPS)
-    if real_fps > 0 and not np.isnan(real_fps):
-        dt = 1.0 / real_fps
-        print(f"[BİLGİ] FPS: {real_fps:.2f} | DT: {dt:.4f} sn")
-    else:
-        dt = 1.0 / 30.0
-        print("[UYARI] FPS okunamadı, 30 FPS varsayılıyor.")
+    # ZEMİN ROI KESİMİ
+    h_raw, w_raw = data['frame'].shape
+    roi_top = int(h_raw * CONFIG['ROI_TOP_CROP_PERCENT'])
 
-    # Sensör Arayüzünü Başlat
-    sensors = DroneSensorInterface()
-    # İstersen yüksekliği buradan manuel düzeltebilirsin:
-    sensors.agl_height_meters = 50.0 
-
-    ret, old_frame = cap.read()
-    if not ret: return
-
-    # --- ROI (GÖKYÜZÜ KESME) AYARI ---
-    h_raw, w_raw = old_frame.shape[:2]
-    roi_start_y = int(h_raw * CONFIG['ROI_SKY_MASK_PERCENT']) # Üst kısmı at
-    
-    # İlk kareyi işle (Kes -> Küçült -> Gri Yap)
-    old_frame_roi = old_frame[roi_start_y:h_raw, 0:w_raw]
-    old_frame_resized = cv.resize(old_frame_roi, None, fx=CONFIG['SCALE_FACTOR'], fy=CONFIG['SCALE_FACTOR'])
-    old_gray = cv.cvtColor(old_frame_resized, cv.COLOR_BGR2GRAY)
-    
-    # İlk noktaları oluştur
-    p0 = generate_grid_features(old_gray, step=40)
-
-    print("[BİLGİ] Analiz Döngüsü Başladı...")
+    old_gray = data['frame'][roi_top:h_raw, 0:w_raw]
+    p0 = generate_grid_features(old_gray, step=30)
 
     while True:
-        ret, frame = cap.read()
-        if not ret: 
-            # Video bitince başa sar
-            cap.set(cv.CAP_PROP_POS_FRAMES, 0)
-            p0 = None
+        data = dataset.get_next_frame_data()
+        if data is None: break
+
+        frame_full = data['frame']
+        frame_gray = frame_full[roi_top:h_raw, 0:w_raw]  # Sadece zemin
+        dt = data['dt']
+        gyro_x, gyro_y = data['gyro']
+        true_vx, true_vy = data['ground_truth_v']
+        agl = data['agl_height']
+
+        vis_frame = cv.cvtColor(frame_full, cv.COLOR_GRAY2BGR)
+        cv.rectangle(vis_frame, (0, roi_top), (w_raw, h_raw), (0, 50, 0), 2)  # Analiz alanını çiz
+
+        if p0 is None or len(p0) < 10:
+            p0 = generate_grid_features(frame_gray, step=30)
+            old_gray = frame_gray.copy()
             continue
 
-        # Sensör Verisini Al
-        telemetry = sensors.get_telemetry_packet()
-        current_agl = telemetry['lidar_agl']
-        current_gyro = telemetry['imu_gyro']
+        p1, st, err = cv.calcOpticalFlowPyrLK(old_gray, frame_gray, p0, None, **CONFIG['LK_PARAMS'])
 
-        # Görüntüyü Kes ve Hazırla
-        frame_roi = frame[roi_start_y:h_raw, 0:w_raw] # Gökyüzünü at
-        vis_frame = cv.resize(frame_roi, None, fx=CONFIG['SCALE_FACTOR'], fy=CONFIG['SCALE_FACTOR'])
-        frame_gray = cv.cvtColor(vis_frame, cv.COLOR_BGR2GRAY)
+        if p1 is not None:
+            good_new = p1[st == 1]
+            good_old = p0[st == 1]
 
-        # Nokta Takibi (Optical Flow)
-        if p0 is None or len(p0) < 50:
-            p0 = generate_grid_features(frame_gray, step=40)
-            old_gray = frame_gray.copy()
-        else:
-            p1, st, err = cv.calcOpticalFlowPyrLK(old_gray, frame_gray, p0, None, **CONFIG['LK_PARAMS'])
-
-            if p1 is not None:
-                good_new = p1[st == 1]
-                good_old = p0[st == 1]
-                
-                # Yeterli nokta var mı?
-                if len(good_new) < 4:
-                    p0 = generate_grid_features(frame_gray, step=40)
-                    old_gray = frame_gray.copy()
-                    continue
-
-                # RANSAC (Outlier Temizliği)
-                M, mask = cv.findHomography(good_old, good_new, cv.RANSAC, CONFIG['RANSAC_THRESHOLD'])
-
-                if M is not None:
-                    matchesMask = mask.ravel().tolist()
-                    inlier_vectors_x = []
-                    inlier_vectors_y = []
-
-                    for i, (new, old) in enumerate(zip(good_new, good_old)):
-                        if matchesMask[i]: # Eğer nokta sağlamsa (Inlier)
-                            dx = new[0] - old[0]
-                            dy = new[1] - old[1]
-                            inlier_vectors_x.append(dx)
-                            inlier_vectors_y.append(dy)
-                            # Yeşil çizgi çiz
-                            cv.line(vis_frame, (int(new[0]), int(new[1])), (int(old[0]), int(old[1])), (0, 255, 0), 1)
-
-                    if len(inlier_vectors_x) > 0:
-                        # Ortalama Piksel Hızı
-                        mean_flow_x = np.mean(inlier_vectors_x)
-                        mean_flow_y = np.mean(inlier_vectors_y)
-
-                        # m/s Dönüşümü
-                        vx_metric = compensated_flow_to_metric_velocity(mean_flow_x, current_agl, CONFIG['FOCAL_LENGTH_PX'], dt, current_gyro)
-                        vy_metric = compensated_flow_to_metric_velocity(mean_flow_y, current_agl, CONFIG['FOCAL_LENGTH_PX'], dt, current_gyro)
-
-                        # Koordinat Dönüşümü (İleri Kamera)
-                        # Akış Aşağı (+Y) ise Drone İleri (+X) gidiyordur.
-                        v_forward = vy_metric
-                        v_right = vx_metric
-
-                        # --- GÖRSELLEŞTİRME ---
-                        color_speed = (0, 255, 0) if v_forward > 0 else (0, 0, 255)
-                        cv.putText(vis_frame, f"HIZ: {v_forward:.2f} m/s", (20, 60), cv.FONT_HERSHEY_SIMPLEX, 0.8, color_speed, 2)
-                        
-                        # Ok Yönü (Akışın tersi)
-                        h, w = vis_frame.shape[:2]
-                        cx, cy = w // 2, h // 2
-                        end_pt = (int(cx - mean_flow_x * 10), int(cy - mean_flow_y * 10))
-                        cv.arrowedLine(vis_frame, (cx, cy), end_pt, (0, 255, 255), 4, tipLength=0.3)
-
-                    old_gray = frame_gray.copy()
-                    p0 = good_new.reshape(-1, 1, 2)
-                else:
-                    old_gray = frame_gray.copy()
-                    p0 = good_new.reshape(-1, 1, 2)
-            else:
-                p0 = generate_grid_features(frame_gray, step=40)
+            if len(good_new) < 4:
+                p0 = generate_grid_features(frame_gray, step=30)
                 old_gray = frame_gray.copy()
+                continue
 
-        # Bilgi Ekranı
-        cv.putText(vis_frame, f"AGL: {current_agl:.1f}m", (20, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        cv.imshow('TUSAS Optical Flow Module (Final)', vis_frame)
-        
-        # FPS Kontrolü
-        delay = int(1000 * dt)
-        if cv.waitKey(delay) & 0xff == 27: # ESC ile çık
-            break
+            M, mask = cv.findHomography(good_old, good_new, cv.RANSAC, CONFIG['RANSAC_THRESHOLD'])
 
-    cap.release()
+            if M is not None:
+                matchesMask = mask.ravel().tolist()
+                inlier_dx, inlier_dy = [], []
+
+                for i, (new, old) in enumerate(zip(good_new, good_old)):
+                    if matchesMask[i]:
+                        inlier_dx.append(new[0] - old[0])
+                        inlier_dy.append(new[1] - old[1])
+                        # Görselleştirmede noktaları doğru yere çizmek için roi_top ekliyoruz
+                        cv.line(vis_frame, (int(new[0]), int(new[1] + roi_top)), (int(old[0]), int(old[1] + roi_top)),
+                                (0, 255, 0), 1)
+
+                if len(inlier_dx) > 0:
+                    mean_dx = np.mean(inlier_dx)
+                    mean_dy = np.mean(inlier_dy)
+
+                    # 1. HAM HIZ (Piksel/sn)
+                    v_px_raw_x = mean_dx / dt
+                    v_px_raw_y = mean_dy / dt
+
+                    # 2. GYRO ROTASYON ETKİSİ
+                    # DİKKAT: Bu işaretler test edilip değiştirilecek!
+                    v_px_rot_x = gyro_x * CONFIG['FOCAL_LENGTH_PX']
+                    v_px_rot_y = gyro_y * CONFIG['FOCAL_LENGTH_PX']
+
+                    # 3. DÜZELTİLMİŞ PİKSEL HIZI (Translation)
+                    v_px_trans_x = v_px_raw_x - v_px_rot_x
+                    v_px_trans_y = v_px_raw_y - v_px_rot_y
+
+                    # 4. METRİK HIZ (Fiziği oturtuyoruz)
+                    # Zemin hacki yaptığımız için, piksellerin kayması derinliğe (AGL) bağlıdır.
+                    # Eğer drone ileri giderse, zemin pikselleri EKSİ Y (aşağı) kayar. Bu yüzden -1 ile çarpıyoruz.
+                    est_vy = -1 * (v_px_trans_y * agl) / CONFIG['FOCAL_LENGTH_PX']
+                    est_vx = (v_px_trans_x * agl) / CONFIG['FOCAL_LENGTH_PX']
+
+                    # Ekrana Yazdır
+                    cv.putText(vis_frame, f"Tahmin Ileri Hiz: {est_vy:.2f} m/s", (20, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6,
+                               (0, 255, 0), 2)
+                    cv.putText(vis_frame, f"Gercek Ileri Hiz (X): {true_vx:.2f} m/s", (20, 60), cv.FONT_HERSHEY_SIMPLEX,
+                               0.6, (0, 0, 255), 2)
+
+                    error = abs(est_vy - true_vx)
+                    cv.putText(vis_frame, f"HATA: {error:.2f} m/s", (20, 100), cv.FONT_HERSHEY_SIMPLEX, 0.6,
+                               (0, 255, 255), 2)
+
+                old_gray = frame_gray.copy()
+                p0 = good_new.reshape(-1, 1, 2)
+            else:
+                old_gray = frame_gray.copy()
+                p0 = good_new.reshape(-1, 1, 2)
+        else:
+            p0 = generate_grid_features(frame_gray, step=30)
+            old_gray = frame_gray.copy()
+
+        cv.imshow('TUSAS - Floor ROI Sensor Fusion', vis_frame)
+        if cv.waitKey(1) & 0xff == 27: break
+
     cv.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
