@@ -50,6 +50,9 @@ class VIODataLoader:
         self.current_idx += 1
         return img_left, img_right, dt_seconds, accel_cam, gyro_cam, true_speed
 
+# =============================================================================
+# 2. FRONTEND ALGORİTMALARI (SGBM ve CLAHE İzgaralama)
+# =============================================================================
 def init_wls_stereo_matcher():
     left_matcher = cv.StereoSGBM_create(minDisparity=0, numDisparities=80, blockSize=5, P1=200, P2=800, disp12MaxDiff=1, uniquenessRatio=15, speckleWindowSize=100, speckleRange=32, mode=cv.STEREO_SGBM_MODE_SGBM_3WAY)
     right_matcher = cv.ximgproc.createRightMatcher(left_matcher)
@@ -58,30 +61,58 @@ def init_wls_stereo_matcher():
     wls_filter.setSigmaColor(1.5)
     return left_matcher, right_matcher, wls_filter
 
+def get_distributed_features(img, max_corners=150, grid_size=(4, 4)):
+    """ Kontrastı artırır ve noktaları ekranın her yerine zorla dağıtır. """
+    clahe = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    img_clahe = clahe.apply(img)
+    
+    h, w = img_clahe.shape
+    grid_h, grid_w = h // grid_size[0], w // grid_size[1]
+    pts_per_grid = max_corners // (grid_size[0] * grid_size[1])
+    distributed_pts = []
+
+    for r in range(grid_size[0]):
+        for c in range(grid_size[1]):
+            y0, y1 = r * grid_h, (r + 1) * grid_h
+            x0, x1 = c * grid_w, (c + 1) * grid_w
+            grid_roi = img_clahe[y0:y1, x0:x1]
+            
+            corners = cv.goodFeaturesToTrack(grid_roi, maxCorners=pts_per_grid, qualityLevel=0.05, minDistance=5)
+            if corners is not None:
+                for pt in corners:
+                    pt[0][0] += x0
+                    pt[0][1] += y0
+                    distributed_pts.append(pt)
+
+    if len(distributed_pts) == 0:
+        return None
+    return np.array(distributed_pts, dtype=np.float32).reshape(-1, 1, 2)
+
+# =============================================================================
+# 3. ANA DÖNGÜ (MASTER VIO)
+# =============================================================================
 def main():
     loader = VIODataLoader()
     left_matcher, right_matcher, wls_filter = init_wls_stereo_matcher()
     filter_eskf = ESKF() 
     
-    # -----------------------------------------------------------------
-    # EKSİK OLAN GERÇEK FİZİK: SENSÖR ISITMA VE HİZALAMA FAZI
-    # -----------------------------------------------------------------
-    print("[SİSTEM] Sensörler ısınıyor, Yerçekimi hizalanıyor. Bekleyin...")
+    print("[SİSTEM] Sensörler ısınıyor, Yerçekimi hizalanıyor...")
     accel_buffer, gyro_buffer = [], []
-    for _ in range(15): # İlk 15 kareyi (~0.7 saniye) veriyi toplamak için kullan
+    for _ in range(15): 
         data = loader.get_frame_data()
         if data is None: return
         accel_buffer.append(data[3])
         gyro_buffer.append(data[4])
     
     filter_eskf.initialize_system(np.array(accel_buffer), np.array(gyro_buffer))
-    print("[SİSTEM] Hizalama Tamamlandı. VIO Döngüsü Başlıyor!")
+    print("[SİSTEM] VIO Döngüsü Başlıyor!")
     
     need_new_keyframe = True
     kf_obj_pts_3d = []
     kf_gyro_accum = np.zeros(3, dtype=np.float64)
     kf_time_elapsed = 0.0 
     old_left = None
+    old_p0 = None
 
     while True:
         data = loader.get_frame_data()
@@ -92,15 +123,17 @@ def main():
         filter_eskf.predict(accel_cam, gyro_cam, dt)
 
         if need_new_keyframe:
-            old_p0 = cv.goodFeaturesToTrack(curr_left, mask=None, maxCorners=150, qualityLevel=0.1, minDistance=7)
-            left_disp = left_matcher.compute(curr_left, curr_right)
-            right_disp = right_matcher.compute(curr_right, curr_left)
-            disp_map = wls_filter.filter(left_disp, curr_left, None, right_disp).astype(np.float32) / 16.0
-            
-            kf_obj_pts_3d = []
-            valid_p0 = []
+            # İŞTE BURASI: Noktaları ızgaralarla, homojen olarak bul!
+            old_p0 = get_distributed_features(curr_left, max_corners=150)
             
             if old_p0 is not None:
+                left_disp = left_matcher.compute(curr_left, curr_right)
+                right_disp = right_matcher.compute(curr_right, curr_left)
+                disp_map = wls_filter.filter(left_disp, curr_left, None, right_disp).astype(np.float32) / 16.0
+                
+                kf_obj_pts_3d = []
+                valid_p0 = []
+                
                 for pt in old_p0:
                     u, v = int(pt[0][0]), int(pt[0][1])
                     if 0 <= v < disp_map.shape[0] and 0 <= u < disp_map.shape[1]:
@@ -113,13 +146,13 @@ def main():
                                 kf_obj_pts_3d.append([X, Y, Z])
                                 valid_p0.append(pt)
 
-            kf_obj_pts_3d = np.array(kf_obj_pts_3d, dtype=np.float64)
-            old_p0 = np.array(valid_p0, dtype=np.float32)
-            
-            kf_gyro_accum = np.zeros(3, dtype=np.float64)
-            kf_time_elapsed = 0.0 
-            need_new_keyframe = False
-            old_left = curr_left.copy()
+                kf_obj_pts_3d = np.array(kf_obj_pts_3d, dtype=np.float64)
+                old_p0 = np.array(valid_p0, dtype=np.float32).reshape(-1, 1, 2)
+                
+                kf_gyro_accum = np.zeros(3, dtype=np.float64)
+                kf_time_elapsed = 0.0 
+                need_new_keyframe = False
+                old_left = curr_left.copy()
             continue
 
         kf_time_elapsed += dt
@@ -132,7 +165,7 @@ def main():
         for pt in good_new:
             cv.circle(vis_frame, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
 
-        if len(good_old_3d) >= 10:
+        if len(good_old_3d) >= 15: # Minimum nokta sayısını güvenli bölgeye çektik
             success, rvec, tvec, inliers = cv.solvePnPRansac(
                 good_old_3d, good_new, K, None, 
                 useExtrinsicGuess=True, 
@@ -142,26 +175,13 @@ def main():
             )
             
             if success and kf_time_elapsed > 0:
-                # -----------------------------------------------------------------
-                # İŞTE KÖTÜ VEKTÖR MATEMATİĞİNİN DÜZELTİLDİĞİ YER
-                # -----------------------------------------------------------------
-                # 1. Rotasyon Vektörünü (rvec) 3x3 Matrise çevir
                 R_pnp, _ = cv.Rodrigues(rvec)
-                
-                # 2. PnP'nin ters dünyasını düzelt: P_cam = -R^T * tvec
-                # Bu bize kameranın Keyframe uzayındaki GERÇEK konumunu verir.
                 t_cam_kf = -R_pnp.T @ tvec
                 
-                # 3. Kameranın Gövde Hızını Bul
                 v_cam_measured = t_cam_kf.flatten() / kf_time_elapsed
-                
-                # 4. Kamera Ekseninden -> IMU Gövde Eksenine geç
                 v_imu_body = R_CB.T @ v_cam_measured
-                
-                # 5. Gövde Ekseninden -> Dünya Eksenine geç
                 v_world_measured = filter_eskf.R @ v_imu_body
                 
-                # Ve HIZI FİLTREYE BESLE!
                 filter_eskf.update_velocity(v_world_measured)
                 
                 kalman_speed = filter_eskf.get_speed()
@@ -170,7 +190,7 @@ def main():
                 error = abs(kalman_speed - true_speed)
                 cv.putText(vis_frame, f"HATA    : {error:.2f} m/s", (20, 90), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        if len(good_old_3d) < 30 or kf_time_elapsed > 0.4:
+        if len(good_old_3d) < 40 or kf_time_elapsed > 0.4:
             need_new_keyframe = True
         else:
             old_p0 = good_new.reshape(-1, 1, 2)
