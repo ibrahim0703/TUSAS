@@ -6,7 +6,7 @@ from config import CONFIG, K, R_CB
 from eskf import ESKF
 
 # =============================================================================
-# 1. VIO DATA LOADER (Accel + Gyro)
+# 1. VIO DATA LOADER
 # =============================================================================
 class VIODataLoader:
     def __init__(self):
@@ -37,7 +37,6 @@ class VIODataLoader:
         imu_idx = (np.abs(self.imu_df['#timestamp [ns]'] - t_cam)).argmin()
         imu_row = self.imu_df.iloc[imu_idx]
         
-        # Ham veriyi Kamera Eksenine Çevir
         w_B = np.array([imu_row['w_RS_S_x [rad s^-1]'], imu_row['w_RS_S_y [rad s^-1]'], imu_row['w_RS_S_z [rad s^-1]']])
         gyro_cam = R_CB @ w_B
         
@@ -63,17 +62,17 @@ def init_wls_stereo_matcher():
     return left_matcher, right_matcher, wls_filter
 
 # =============================================================================
-# 3. ANA DÖNGÜ (FRONTEND + BACKEND ENTEGRASYONU)
+# 3. ANA DÖNGÜ (FRONTEND + BACKEND)
 # =============================================================================
 def main():
     loader = VIODataLoader()
     left_matcher, right_matcher, wls_filter = init_wls_stereo_matcher()
-    filter_eskf = ESKF() # Kalman Filtresini Başlat
+    filter_eskf = ESKF() 
     
     need_new_keyframe = True
     kf_obj_pts_3d = []
     kf_gyro_accum = np.zeros(3, dtype=np.float64)
-    kf_time_elapsed = 0.0 # EKSİK OLAN ZAMAN TUTUCU
+    kf_time_elapsed = 0.0 
     old_left = None
 
     while True:
@@ -83,12 +82,12 @@ def main():
         vis_frame = cv.cvtColor(curr_left, cv.COLOR_GRAY2BGR)
 
         # -----------------------------------------------------------------
-        # ESKF PREDICT (Daima Çalışır - Yüksek Frekans)
+        # ESKF PREDICT (Daima Çalışır)
         # -----------------------------------------------------------------
         filter_eskf.predict(accel_cam, gyro_cam, dt)
 
         # -----------------------------------------------------------------
-        # ANA KARE (KEYFRAME) OLUŞTURMA
+        # ANA KARE OLUŞTURMA
         # -----------------------------------------------------------------
         if need_new_keyframe:
             old_p0 = cv.goodFeaturesToTrack(curr_left, mask=None, maxCorners=150, qualityLevel=0.1, minDistance=7)
@@ -115,7 +114,6 @@ def main():
             kf_obj_pts_3d = np.array(kf_obj_pts_3d, dtype=np.float64)
             old_p0 = np.array(valid_p0, dtype=np.float32)
             
-            # Keyframe başlangıcında zamanı ve dönüş birikimini sıfırla
             kf_gyro_accum = np.zeros(3, dtype=np.float64)
             kf_time_elapsed = 0.0 
             
@@ -146,16 +144,14 @@ def main():
             )
             
             if success and kf_time_elapsed > 0:
-                # 1. PnP'nin ürettiği yer değiştirmeyi hıza çevir
                 v_cam_measured = tvec.flatten() / kf_time_elapsed
+                v_imu_body = R_CB.T @ v_cam_measured
                 
-                # 2. Kameradaki hızı IMU'nun eksenine döndür
-                v_imu_measured = R_CB.T @ v_cam_measured
+                # İŞTE O MATEMATİKSEL KÖPRÜ: Gövde Hızını DÜNYA Hızına Çevir
+                v_world_measured = filter_eskf.R @ v_imu_body
                 
-                # 3. ESKF'ye HIZ Ölçümü olarak enjekte et
-                filter_eskf.update_velocity(v_imu_measured)
+                filter_eskf.update_velocity(v_world_measured)
                 
-                # Ekran Çıktıları
                 kalman_speed = filter_eskf.get_speed()
                 cv.putText(vis_frame, f"ESKF Hiz: {kalman_speed:.2f} m/s", (20, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv.putText(vis_frame, f"GT Hiz  : {true_speed:.2f} m/s", (20, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
