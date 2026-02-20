@@ -1,199 +1,93 @@
 import numpy as np
-import cv2 as cv
-import pandas as pd
-import os
 
-# =============================================================================
-# 1. KONFİGÜRASYON VE KALİBRASYON
-# =============================================================================
-CONFIG = {
-    'CAM0_CSV': 'cam0/data.csv',
-    'CAM0_DIR': 'cam0/data',
-    'CAM1_CSV': 'cam1/data.csv',
-    'CAM1_DIR': 'cam1/data',
-    'IMU_CSV_PATH': 'imu0/data.csv',
-    'GT_CSV_PATH': 'state_groundtruth_estimate0/data.csv',
-    
-    'FOCAL_LENGTH_PX': 458.654,
-    'CX': 376.0, 
-    'CY': 240.0, 
-    'BASELINE_M': 0.11,
-    
-    'LK_PARAMS': dict(winSize=(21, 21), maxLevel=3, criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01))
-}
-
-K = np.array([[CONFIG['FOCAL_LENGTH_PX'], 0, CONFIG['CX']],
-              [0, CONFIG['FOCAL_LENGTH_PX'], CONFIG['CY']],
-              [0, 0, 1]], dtype=np.float64)
-
-# EuRoC cam0 -> IMU Extrinsic Matrisi (T_BS)
-T_BS = np.array([
-    [0.0148655429818, -0.999880929698, 0.00414029679422, -0.0216401454975],
-    [0.999557249008, 0.0149672133247, 0.025715529948, -0.064676986768],
-    [-0.0257744366974, 0.00375618835797, 0.999660727108, 0.00981073058949],
-    [0.0, 0.0, 0.0, 1.0]
-], dtype=np.float64)
-
-# Rotation Matrisini (3x3) ayır ve Body'den Sensor'e (Kameraya) geçiş için Transpozunu al (R_CB)
-R_BS = T_BS[:3, :3]
-R_CB = R_BS.T
-
-# =============================================================================
-# 2. VIO DATA LOADER
-# =============================================================================
-class VIODataLoader:
+class ESKF:
     def __init__(self):
-        df0 = pd.read_csv(CONFIG['CAM0_CSV'], names=['timestamp', 'filename'], header=0)
-        df1 = pd.read_csv(CONFIG['CAM1_CSV'], names=['timestamp', 'filename'], header=0)
-        self.imu_df = pd.read_csv(CONFIG['IMU_CSV_PATH'])
-        self.imu_df.columns = self.imu_df.columns.str.strip()
-        self.gt_df = pd.read_csv(CONFIG['GT_CSV_PATH'])
-        self.gt_df.columns = self.gt_df.columns.str.strip()
+        print("[SİSTEM] Error-State Kalman Filter (ESKF) Başlatıldı.")
         
-        df0 = df0.sort_values('timestamp')
-        df1 = df1.sort_values('timestamp')
-        self.stereo_df = pd.merge_asof(df0, df1, on='timestamp', direction='nearest', suffixes=('_left', '_right'))
-        self.current_idx = 0
-        self.total_frames = len(self.stereo_df)
-
-    def get_frame_data(self):
-        if self.current_idx >= self.total_frames - 1:
-            return None
-        row = self.stereo_df.iloc[self.current_idx]
-        t_cam = row['timestamp']
-        t_next = self.stereo_df.iloc[self.current_idx + 1]['timestamp']
-        dt_seconds = (t_next - t_cam) / 1e9
+        # ---------------------------------------------------------
+        # 1. NOMİNAL DURUM (Nominal State) - Gerçekte Neredeyiz?
+        # ---------------------------------------------------------
+        self.p = np.zeros(3) # Pozisyon (X, Y, Z) - Metre
+        self.v = np.zeros(3) # Hız (Vx, Vy, Vz) - m/s
+        self.R = np.eye(3)   # Yönelim (Rotation Matrix) - 3x3 Birim Matris
         
-        img_left = cv.imread(os.path.join(CONFIG['CAM0_DIR'], str(row['filename_left'])), cv.IMREAD_GRAYSCALE)
-        img_right = cv.imread(os.path.join(CONFIG['CAM1_DIR'], str(row['filename_right'])), cv.IMREAD_GRAYSCALE)
+        # IMU Fabrika Hataları (Bias)
+        self.bg = np.zeros(3) # Jiroskop Bias (rad/s)
+        self.ba = np.zeros(3) # İvmeölçer Bias (m/s^2)
         
-        imu_idx = (np.abs(self.imu_df['#timestamp [ns]'] - t_cam)).argmin()
-        imu_row = self.imu_df.iloc[imu_idx]
+        self.g = np.array([0, 0, -9.81]) # Yerçekimi Vektörü (Z ekseninde aşağı doğru)
+
+        # ---------------------------------------------------------
+        # 2. HATA DURUMU KOVARYANSI (Error-State Covariance - P)
+        # ---------------------------------------------------------
+        # Sistemimize ne kadar güveniyoruz? (15x15 Matris)
+        # Sırası: [delta_p, delta_v, delta_theta, delta_bg, delta_ba]
+        self.P = np.eye(15) * 0.01 
         
-        # IMU'dan gelen ham Body Frame Jiroskop verisi
-        w_B = np.array([
-            imu_row['w_RS_S_x [rad s^-1]'],
-            imu_row['w_RS_S_y [rad s^-1]'],
-            imu_row['w_RS_S_z [rad s^-1]']
-        ], dtype=np.float64)
+        # ---------------------------------------------------------
+        # 3. GÜRÜLTÜ MATRİSLERİ (Noise)
+        # ---------------------------------------------------------
+        # IMU ne kadar gürültülü? (Q Matrisi)
+        self.Q = np.eye(12) * 0.001 
         
-        # --- İŞTE GERÇEK MÜHENDİSLİK: Matris Çarpımı ile Kamera Eksenine Çevir ---
-        gyro_vector_cam = R_CB @ w_B
+        # Kamera (PnP) ne kadar gürültülü? (R Matrisi - Ölçüm gürültüsü)
+        # Z ekseni (Derinlik) her zaman daha gürültülüdür, ona daha az güveniriz.
+        self.R_cam = np.diag([0.05, 0.05, 0.2]) 
+
+    def predict(self, accel, gyro, dt):
+        """
+        Adım 1: TAHMİN (Prediction) - Yüksek Frekans (IMU verisi geldikçe çalışır)
+        Fiziksel formüllerle (İvme -> Hız -> Konum) bir sonraki adımı tahmin ederiz.
+        """
+        # 1. Bias düzeltmesi (Fabrika hatalarını çıkar)
+        accel_true = accel - self.ba
+        gyro_true = gyro - self.bg
         
-        gt_idx = (np.abs(self.gt_df['#timestamp'] - t_cam)).argmin()
-        gt_row = self.gt_df.iloc[gt_idx]
-        true_speed = np.sqrt(gt_row['v_RS_R_x [m s^-1]']**2 + gt_row['v_RS_R_y [m s^-1]']**2 + gt_row['v_RS_R_z [m s^-1]']**2)
-
-        self.current_idx += 1
-        return img_left, img_right, dt_seconds, gyro_vector_cam, true_speed
-
-# =============================================================================
-# 3. WLS STEREO MATCHER
-# =============================================================================
-def init_wls_stereo_matcher():
-    left_matcher = cv.StereoSGBM_create(minDisparity=0, numDisparities=80, blockSize=5, P1=200, P2=800, disp12MaxDiff=1, uniquenessRatio=15, speckleWindowSize=100, speckleRange=32, mode=cv.STEREO_SGBM_MODE_SGBM_3WAY)
-    right_matcher = cv.ximgproc.createRightMatcher(left_matcher)
-    wls_filter = cv.ximgproc.createDisparityWLSFilter(matcher_left=left_matcher)
-    wls_filter.setLambda(8000.0)
-    wls_filter.setSigmaColor(1.5)
-    return left_matcher, right_matcher, wls_filter
-
-# =============================================================================
-# 4. ANA DÖNGÜ (Keyframe Stratejisi)
-# =============================================================================
-def main():
-    loader = VIODataLoader()
-    left_matcher, right_matcher, wls_filter = init_wls_stereo_matcher()
-    
-    need_new_keyframe = True
-    kf_obj_pts_3d = []
-    kf_img_pts_2d = []
-    kf_time_elapsed = 0.0
-    kf_gyro_accum = np.zeros(3, dtype=np.float64)
-    old_left = None
-
-    while True:
-        data = loader.get_frame_data()
-        if data is None: break
-        curr_left, curr_right, dt, gyro_vector_cam, true_speed = data
-        vis_frame = cv.cvtColor(curr_left, cv.COLOR_GRAY2BGR)
-
-        if need_new_keyframe:
-            old_p0 = cv.goodFeaturesToTrack(curr_left, mask=None, maxCorners=150, qualityLevel=0.1, minDistance=7)
-            left_disp = left_matcher.compute(curr_left, curr_right)
-            right_disp = right_matcher.compute(curr_right, curr_left)
-            disp_map = wls_filter.filter(left_disp, curr_left, None, right_disp).astype(np.float32) / 16.0
-            
-            kf_obj_pts_3d = []
-            valid_p0 = []
-            
-            if old_p0 is not None:
-                for pt in old_p0:
-                    u, v = int(pt[0][0]), int(pt[0][1])
-                    if 0 <= v < disp_map.shape[0] and 0 <= u < disp_map.shape[1]:
-                        d = disp_map[v, u]
-                        if d > 1.0:
-                            Z = (CONFIG['FOCAL_LENGTH_PX'] * CONFIG['BASELINE_M']) / d
-                            X = (u - CONFIG['CX']) * Z / CONFIG['FOCAL_LENGTH_PX']
-                            Y = (v - CONFIG['CY']) * Z / CONFIG['FOCAL_LENGTH_PX']
-                            if Z < 15.0:
-                                kf_obj_pts_3d.append([X, Y, Z])
-                                valid_p0.append(pt)
-
-            kf_obj_pts_3d = np.array(kf_obj_pts_3d, dtype=np.float64)
-            old_p0 = np.array(valid_p0, dtype=np.float32)
-            
-            kf_time_elapsed = 0.0
-            kf_gyro_accum = np.zeros(3, dtype=np.float64)
-            need_new_keyframe = False
-            old_left = curr_left.copy()
-            
-            cv.putText(vis_frame, "*** YENI ANA KARE (KEYFRAME) ***", (20, 150), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-            cv.imshow('TUSAS - Keyframe VIO', vis_frame)
-            cv.waitKey(10)
-            continue
-
-        kf_time_elapsed += dt
-        kf_gyro_accum += gyro_vector_cam * dt # Matrisle düzeltilmiş Jiroskop verisini entegre et
+        # 2. Nominal Durumu Güncelle (Fizik Entegrasyonu)
+        # Yeni Pozisyon: p = p + v*dt + 0.5*(R*a + g)*dt^2
+        accel_world = self.R @ accel_true + self.g
+        self.p = self.p + self.v * dt + 0.5 * accel_world * (dt ** 2)
         
-        curr_p1, st, err = cv.calcOpticalFlowPyrLK(old_left, curr_left, old_p0, None, **CONFIG['LK_PARAMS'])
-        good_new = curr_p1[st == 1]
-        good_old_3d = kf_obj_pts_3d[st.flatten() == 1]
+        # Yeni Hız: v = v + (R*a + g)*dt
+        self.v = self.v + accel_world * dt
         
-        for pt in good_new:
-            cv.circle(vis_frame, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
+        # Yeni Yönelim: Basit Rodrigues Dönüşümü (Daha profesyoneli Quaternion'dur)
+        # R = R * exp(w*dt)
+        theta = np.linalg.norm(gyro_true) * dt
+        if theta > 1e-8:
+            axis = gyro_true / np.linalg.norm(gyro_true)
+            K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+            R_delta = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
+            self.R = self.R @ R_delta
 
-        est_speed = 0.0
-        if len(good_old_3d) >= 10:
-            success, rvec, tvec, inliers = cv.solvePnPRansac(
-                good_old_3d, good_new, K, None, 
-                useExtrinsicGuess=True, 
-                rvec=kf_gyro_accum.reshape(3,1), 
-                tvec=np.zeros((3,1)),
-                flags=cv.SOLVEPNP_ITERATIVE, iterationsCount=100, reprojectionError=2.0
-            )
-            
-            if success:
-                translation_magnitude = np.linalg.norm(tvec)
-                if kf_time_elapsed > 0:
-                    est_speed = translation_magnitude / kf_time_elapsed
-                
-                cv.putText(vis_frame, f"Stabil VIO Hiz : {est_speed:.2f} m/s", (20, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv.putText(vis_frame, f"Gercek Hiz (GT): {true_speed:.2f} m/s", (20, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                error = abs(est_speed - true_speed)
-                cv.putText(vis_frame, f"HATA           : {error:.2f} m/s", (20, 90), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        # 3. Kovaryansı (Belirsizliği) Güncelle: P = F * P * F^T + Q
+        # (Şimdilik F matrisinin karmaşık Jacobian hesaplamalarını atlıyoruz, 
+        # belirsizliğin zamanla arttığını simüle ediyoruz).
+        self.P = self.P + np.eye(15) * 0.005 # Her adımda belirsizlik artar
 
-        if len(good_old_3d) < 30 or kf_time_elapsed > 0.4:
-            need_new_keyframe = True
-        else:
-            old_p0 = good_new.reshape(-1, 1, 2)
-            kf_obj_pts_3d = good_old_3d
-            old_left = curr_left.copy()
-
-        cv.imshow('TUSAS - Keyframe VIO', vis_frame)
-        if cv.waitKey(10) & 0xff == 27: break
-
-    cv.destroyAllWindows()
-
-if __name__ == "__main__":
-    main()
+    def update_with_pnp(self, pnp_translation):
+        """
+        Adım 2: GÜNCELLEME (Correction) - Düşük Frekans (Kamera Keyframe ürettikçe çalışır)
+        Kameradan gelen gerçek ölçümle, IMU'nun tahminini çarpıştırır.
+        """
+        # Hata (Innovation): Kameranın gördüğü pozisyon eksi bizim IMU ile tahmin ettiğimiz pozisyon
+        innovation = pnp_translation.flatten() - self.p
+        
+        # Kalman Kazancı (Kalman Gain - K) hesaplaması
+        # H (Gözlem Matrisi) pozisyonu izlediğimiz için ilk 3x3'lük kısımdır.
+        H = np.zeros((3, 15))
+        H[:, 0:3] = np.eye(3)
+        
+        S = H @ self.P @ H.T + self.R_cam # İnovasyon Kovaryansı
+        K = self.P @ H.T @ np.linalg.inv(S) # K = P * H^T * S^-1
+        
+        # Hata Durumunu (Error State) Hesapla
+        error_state = K @ innovation
+        
+        # Nominal Duruma Hataları Enjekte Et (Düzeltme)
+        self.p += error_state[0:3]
+        self.v += error_state[3:6]
+        # (Yönelim ve Bias düzeltmeleri bu aşamada sade tutulmuştur)
+        
+        # Belirsizliği (Kovaryans) Düşür: P = (I - K*H) * P
+        self.P = (np.eye(15) - K @ H) @ self.P
