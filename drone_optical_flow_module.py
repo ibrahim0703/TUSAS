@@ -11,20 +11,31 @@ CONFIG = {
     'CAM0_DIR': 'cam0/data',
     'CAM1_CSV': 'cam1/data.csv',
     'CAM1_DIR': 'cam1/data',
+    'GT_CSV_PATH': 'state_groundtruth_estimate0/data.csv',
     
     'FOCAL_LENGTH_PX': 458.654,
-    'BASELINE_M': 0.11,  # EuRoC kameraları arasındaki fiziksel mesafe (11 cm)
+    'CX': 376.0, # EuRoC 752x480 çözünürlüğün X merkezi
+    'CY': 240.0, # EuRoC 752x480 çözünürlüğün Y merkezi
+    'BASELINE_M': 0.11,
     
     'LK_PARAMS': dict(winSize=(21, 21), maxLevel=3, criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01))
 }
 
+# Kamera İç Parametre Matrisi (Intrinsic Matrix - K)
+K = np.array([[CONFIG['FOCAL_LENGTH_PX'], 0, CONFIG['CX']],
+              [0, CONFIG['FOCAL_LENGTH_PX'], CONFIG['CY']],
+              [0, 0, 1]], dtype=np.float64)
+
 # =============================================================================
-# 2. STEREO DATA LOADER
+# 2. DATA LOADER (Kameralar + Ground Truth)
 # =============================================================================
 class StereoDataLoader:
     def __init__(self):
         df0 = pd.read_csv(CONFIG['CAM0_CSV'], names=['timestamp', 'filename'], header=0)
         df1 = pd.read_csv(CONFIG['CAM1_CSV'], names=['timestamp', 'filename'], header=0)
+        
+        self.gt_df = pd.read_csv(CONFIG['GT_CSV_PATH'])
+        self.gt_df.columns = self.gt_df.columns.str.strip()
         
         df0 = df0.sort_values('timestamp')
         df1 = df1.sort_values('timestamp')
@@ -33,16 +44,33 @@ class StereoDataLoader:
         self.current_idx = 0
         self.total_frames = len(self.stereo_df)
 
-    def get_stereo_pair(self):
-        if self.current_idx >= self.total_frames:
-            return None, None
+    def get_frame_data(self):
+        if self.current_idx >= self.total_frames - 1:
+            return None
             
         row = self.stereo_df.iloc[self.current_idx]
+        t_cam = row['timestamp']
+        
+        # dt hesaplama
+        t_next = self.stereo_df.iloc[self.current_idx + 1]['timestamp']
+        dt_seconds = (t_next - t_cam) / 1e9
+        
         img_left = cv.imread(os.path.join(CONFIG['CAM0_DIR'], str(row['filename_left'])), cv.IMREAD_GRAYSCALE)
         img_right = cv.imread(os.path.join(CONFIG['CAM1_DIR'], str(row['filename_right'])), cv.IMREAD_GRAYSCALE)
         
+        # Ground Truth Senkronizasyonu
+        gt_idx = (np.abs(self.gt_df['#timestamp'] - t_cam)).argmin()
+        gt_row = self.gt_df.iloc[gt_idx]
+        
+        # EuRoC eksenlerinde ileri gidiş +X olarak kodlanmıştır (World Frame'e göre)
+        # Hız büyüklüğünü (Magnitude) alıyoruz ki yön karmaşası yaşamayalım
+        vx = gt_row['v_RS_R_x [m s^-1]']
+        vy = gt_row['v_RS_R_y [m s^-1]']
+        vz = gt_row['v_RS_R_z [m s^-1]']
+        true_speed = np.sqrt(vx**2 + vy**2 + vz**2)
+
         self.current_idx += 1
-        return img_left, img_right
+        return img_left, img_right, dt_seconds, true_speed
 
 # =============================================================================
 # 3. WLS STEREO MATCHER
@@ -62,82 +90,99 @@ def init_wls_stereo_matcher():
     return left_matcher, right_matcher, wls_filter
 
 # =============================================================================
-# 4. ANA DÖNGÜ (Optik Akış + 3D Derinlik Çıkarımı)
+# 4. ANA DÖNGÜ (PnP Pose Estimation)
 # =============================================================================
 def main():
     loader = StereoDataLoader()
     left_matcher, right_matcher, wls_filter = init_wls_stereo_matcher()
     
-    # İlk kareyi al
-    old_left, _ = loader.get_stereo_pair()
+    # 1. İlk Kareyi Hazırla
+    old_left, old_right, _, _ = loader.get_frame_data()
     if old_left is None: return
     
-    # Eskiden ızgara çiziyordun. Şimdi SADECE dokulu (köşeli) yerleri bulacağız ki derinlikleri %100 çıksın.
-    p0 = cv.goodFeaturesToTrack(old_left, mask=None, maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
+    old_p0 = cv.goodFeaturesToTrack(old_left, mask=None, maxCorners=150, qualityLevel=0.1, minDistance=7)
+    
+    # İlk karenin derinlik haritasını çıkar
+    left_disp = left_matcher.compute(old_left, old_right)
+    right_disp = right_matcher.compute(old_right, old_left)
+    old_disp = wls_filter.filter(left_disp, old_left, None, right_disp).astype(np.float32) / 16.0
 
     while True:
-        img_left, img_right = loader.get_stereo_pair()
-        if img_left is None: break
-            
-        # 1. Derinlik Haritasını Çıkar
-        left_disp = left_matcher.compute(img_left, img_right)
-        right_disp = right_matcher.compute(img_right, img_left)
-        filtered_disp = wls_filter.filter(left_disp, img_left, None, right_disp)
+        data = loader.get_frame_data()
+        if data is None: break
+        curr_left, curr_right, dt, true_speed = data
         
-        # Gerçek piksel kaymasına (Disparity) çevir
-        disp_float = filtered_disp.astype(np.float32) / 16.0
-        
-        vis_frame = cv.cvtColor(img_left, cv.COLOR_GRAY2BGR)
+        vis_frame = cv.cvtColor(curr_left, cv.COLOR_GRAY2BGR)
 
-        # 2. Optik Akış ile Noktaları Takip Et
-        if p0 is not None and len(p0) > 10:
-            p1, st, err = cv.calcOpticalFlowPyrLK(old_left, img_left, p0, None, **CONFIG['LK_PARAMS'])
+        # 2. Optik Akış ile noktaları yeni kareye taşı
+        if old_p0 is not None and len(old_p0) > 10:
+            curr_p1, st, err = cv.calcOpticalFlowPyrLK(old_left, curr_left, old_p0, None, **CONFIG['LK_PARAMS'])
             
-            good_new = p1[st == 1]
-            good_old = p0[st == 1]
+            good_new = curr_p1[st == 1]
+            good_old = old_p0[st == 1]
             
-            valid_3d_points = 0
+            # 3. 3D-2D Eşleştirme Dizilerini Hazırla
+            obj_pts_3d = [] # Eski karedeki 3B Gerçek Dünya Koordinatları
+            img_pts_2d = [] # Yeni karedeki 2B Ekran Koordinatları
             
             for i, (new, old) in enumerate(zip(good_new, good_old)):
-                x_px, y_px = int(new[0]), int(new[1])
+                u_old, v_old = int(old[0]), int(old[1])
+                u_new, v_new = new[0], new[1]
                 
-                # Sınır kontrolü (Matris dışına çıkmamak için)
-                if 0 <= y_px < disp_float.shape[0] and 0 <= x_px < disp_float.shape[1]:
+                if 0 <= v_old < old_disp.shape[0] and 0 <= u_old < old_disp.shape[1]:
+                    d = old_disp[v_old, u_old]
                     
-                    # --- İŞTE O SİHİRLİ MATEMATİK BURADA ---
-                    d = disp_float[y_px, x_px]
-                    
-                    # Sadece geçerli derinliği olan (siyah delik olmayan) noktaları işle
-                    if d > 0:
-                        # Z = (f * B) / d
-                        z_meters = (CONFIG['FOCAL_LENGTH_PX'] * CONFIG['BASELINE_M']) / d
+                    if d > 1.0: # Çok uzak ve gürültülü noktaları (d<1) alma
+                        # --- 3B KOORDİNAT HESABI (Kamera Eksenine Göre) ---
+                        Z = (CONFIG['FOCAL_LENGTH_PX'] * CONFIG['BASELINE_M']) / d
+                        X = (u_old - CONFIG['CX']) * Z / CONFIG['FOCAL_LENGTH_PX']
+                        Y = (v_old - CONFIG['CY']) * Z / CONFIG['FOCAL_LENGTH_PX']
                         
-                        # 10 metreden uzak veriler genelde gürültülüdür, filtrele
-                        if z_meters < 10.0:
-                            valid_3d_points += 1
+                        if Z < 15.0: # 15 metreden uzak noktalar PnP'yi bozar
+                            obj_pts_3d.append([X, Y, Z])
+                            img_pts_2d.append([u_new, v_new])
                             
-                            # Görselleştirme: Yakın noktaları Kırmızı, Uzak noktaları Mavi çiz
-                            color = (255, max(0, 255 - int(z_meters*25)), 0) 
-                            cv.circle(vis_frame, (x_px, y_px), 4, color, -1)
-                            # Yanına uzaklığı metre cinsinden yaz
-                            cv.putText(vis_frame, f"{z_meters:.1f}m", (x_px+5, y_px-5), cv.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                            # Görselleştirme
+                            cv.circle(vis_frame, (int(u_new), int(v_new)), 3, (0, 255, 0), -1)
 
-            # Ekrana Bilgi Bas
-            cv.putText(vis_frame, f"Takip Edilen Nokta: {len(good_new)}", (20, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv.putText(vis_frame, f"Geçerli 3D Nokta: {valid_3d_points}", (20, 60), cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            obj_pts_3d = np.array(obj_pts_3d, dtype=np.float64)
+            img_pts_2d = np.array(img_pts_2d, dtype=np.float64)
 
-            old_left = img_left.copy()
-            p0 = good_new.reshape(-1, 1, 2)
+            # 4. PnP ile Kameranın Hareketini (Pose) Çöz
+            if len(obj_pts_3d) >= 6: # PnP için minimum 6 nokta gerekir (RANSAC ile)
+                # Kamera nereye gitti?
+                success, rvec, tvec, inliers = cv.solvePnPRansac(
+                    obj_pts_3d, img_pts_2d, K, None, 
+                    flags=cv.SOLVEPNP_ITERATIVE, iterationsCount=100, reprojectionError=2.0
+                )
+                
+                if success:
+                    # tvec (Translation Vector), kameranın eski konuma göre X,Y,Z eksenlerinde metre cinsinden ne kadar kaydığını verir.
+                    # Hız (V) = Yerdeğiştirme (tvec) / Zaman (dt)
+                    translation_magnitude = np.linalg.norm(tvec)
+                    est_speed = translation_magnitude / dt
+                    
+                    # RANSAC'ın sağlam (inlier) kabul ettiği nokta sayısı
+                    inlier_count = len(inliers) if inliers is not None else 0
+
+                    # --- EKRANA BAS ---
+                    cv.putText(vis_frame, f"Tahmin Edilen Hiz: {est_speed:.2f} m/s", (20, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv.putText(vis_frame, f"Gercek Hiz (GT)  : {true_speed:.2f} m/s", (20, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    
+                    error = abs(est_speed - true_speed)
+                    cv.putText(vis_frame, f"HATA: {error:.2f} m/s", (20, 90), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    cv.putText(vis_frame, f"PnP Inliers: {inlier_count}/{len(obj_pts_3d)}", (20, 120), cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            # 5. Bir sonraki kare için hazırlık yap
+            old_left = curr_left.copy()
+            # Yeni karenin derinlik haritasını çıkar
+            left_disp = left_matcher.compute(curr_left, curr_right)
+            right_disp = right_matcher.compute(curr_right, curr_left)
+            old_disp = wls_filter.filter(left_disp, curr_left, None, right_disp).astype(np.float32) / 16.0
             
-            # Eğer nokta sayısı çok azaldıysa yeniden özellik bul
-            if len(good_new) < 30:
-                p0 = cv.goodFeaturesToTrack(img_left, mask=None, maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
+            old_p0 = cv.goodFeaturesToTrack(curr_left, mask=None, maxCorners=150, qualityLevel=0.1, minDistance=7)
 
-        else:
-            p0 = cv.goodFeaturesToTrack(img_left, mask=None, maxCorners=100, qualityLevel=0.3, minDistance=7, blockSize=7)
-            old_left = img_left.copy()
-
-        cv.imshow('TUSAS - Stereo VIO (3D Point Tracking)', vis_frame)
+        cv.imshow('TUSAS - Stereo VIO (Metric Velocity)', vis_frame)
 
         if cv.waitKey(30) & 0xff == 27: break
 
