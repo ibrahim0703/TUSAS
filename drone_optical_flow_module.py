@@ -4,195 +4,118 @@ import pandas as pd
 import os
 
 # =============================================================================
-# 1. KONFİGÜRASYON (EuRoC MH_01_easy - Zemin Hack)
+# 1. KONFİGÜRASYON
 # =============================================================================
 CONFIG = {
-    'CAM_CSV_PATH': 'cam0/data.csv',
-    'CAM_IMG_DIR': 'cam0/data',
-    'IMU_CSV_PATH': 'imu0/data.csv',
-    'GT_CSV_PATH': 'state_groundtruth_estimate0/data.csv',
-
-    'FOCAL_LENGTH_PX': 458.654,  # EuRoC cam0 fx
-
-    # --- ZEMİN HACK AYARI ---
-    # Görüntünün SADECE ALT %40'ını alacağız (Zemine bakan kısım)
-    'ROI_TOP_CROP_PERCENT': 0.60,
-
-    'RANSAC_THRESHOLD': 3.0,
-    'LK_PARAMS': dict(winSize=(21, 21), maxLevel=3, criteria=(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01))
+    'CAM0_CSV': 'cam0/data.csv',
+    'CAM0_DIR': 'cam0/data',
+    'CAM1_CSV': 'cam1/data.csv',
+    'CAM1_DIR': 'cam1/data',
 }
 
-
 # =============================================================================
-# 2. EUROC DATA LOADER (Senkronizasyon Motoru)
+# 2. STEREO DATA LOADER (Donanımsal Senkronizasyon)
 # =============================================================================
-class EurocDataLoader:
+class StereoDataLoader:
     def __init__(self):
-        print("[SİSTEM] EuRoC Veri Seti Yükleniyor...")
-        self.cam_df = pd.read_csv(CONFIG['CAM_CSV_PATH'])
-        self.cam_df.columns = ['timestamp', 'filename']
-
-        self.imu_df = pd.read_csv(CONFIG['IMU_CSV_PATH'])
-        self.imu_df.columns = self.imu_df.columns.str.strip()
-
-        self.gt_df = pd.read_csv(CONFIG['GT_CSV_PATH'])
-        self.gt_df.columns = self.gt_df.columns.str.strip()
-
-        self.total_frames = len(self.cam_df)
+        print("[SİSTEM] Stereo Kameralar (Cam0 ve Cam1) Yükleniyor...")
+        
+        # Sol ve Sağ kamera kayıt defterlerini oku
+        df0 = pd.read_csv(CONFIG['CAM0_CSV'])
+        df0.columns = ['timestamp', 'filename']
+        
+        df1 = pd.read_csv(CONFIG['CAM1_CSV'])
+        df1.columns = ['timestamp', 'filename']
+        
+        # EuRoC'ta iki kamera donanımsal olarak aynı nanosaniyede tetiklenir.
+        # Yine de en yakın zaman damgalarını eşleştirerek sağlamlaştırıyoruz.
+        df0 = df0.sort_values('timestamp')
+        df1 = df1.sort_values('timestamp')
+        
+        # merge_asof: Cam0'daki her fotoğrafa, Cam1'den zamansal olarak en yakın fotoğrafı bağlar
+        self.stereo_df = pd.merge_asof(df0, df1, on='timestamp', direction='nearest', suffixes=('_left', '_right'))
+        print(f"[BİLGİ] {len(self.stereo_df)} adet Stereo Görüntü Çifti başarıyla senkronize edildi.")
+        
         self.current_idx = 0
+        self.total_frames = len(self.stereo_df)
 
-    def get_next_frame_data(self):
-        if self.current_idx >= self.total_frames - 1:
-            return None
-
-        cam_row = self.cam_df.iloc[self.current_idx]
-        t_cam = cam_row['timestamp']
-        img_name = cam_row['filename']
-        img_path = os.path.join(CONFIG['CAM_IMG_DIR'], str(img_name))
-
-        t_cam_next = self.cam_df.iloc[self.current_idx + 1]['timestamp']
-        dt_seconds = (t_cam_next - t_cam) / 1e9
-
-        frame = cv.imread(img_path, cv.IMREAD_GRAYSCALE)
-        if frame is None:
-            print(f"[HATA] Fotoğraf bulunamadı: {img_path}")
-            self.current_idx += 1
-            return self.get_next_frame_data()
-
-        # IMU Senkronizasyonu
-        imu_idx = (np.abs(self.imu_df['#timestamp [ns]'] - t_cam)).argmin()
-        imu_row = self.imu_df.iloc[imu_idx]
-        gyro_x = imu_row['w_RS_S_x [rad s^-1]']
-        gyro_y = imu_row['w_RS_S_y [rad s^-1]']
-
-        # Ground Truth Senkronizasyonu
-        gt_idx = (np.abs(self.gt_df['#timestamp'] - t_cam)).argmin()
-        gt_row = self.gt_df.iloc[gt_idx]
-        true_vx = gt_row['v_RS_R_x [m s^-1]']
-
-        # EuRoC'ta x ileri, y sol, z yukarıdır. İleri hızı alıyoruz.
-        true_vy = gt_row['v_RS_R_y [m s^-1]']
-        true_z_height = abs(gt_row['p_RS_R_z [m]'])
-
+    def get_stereo_pair(self):
+        if self.current_idx >= self.total_frames:
+            return None, None
+            
+        row = self.stereo_df.iloc[self.current_idx]
+        
+        img_left_path = os.path.join(CONFIG['CAM0_DIR'], str(row['filename_left']))
+        img_right_path = os.path.join(CONFIG['CAM1_DIR'], str(row['filename_right']))
+        
+        img_left = cv.imread(img_left_path, cv.IMREAD_GRAYSCALE)
+        img_right = cv.imread(img_right_path, cv.IMREAD_GRAYSCALE)
+        
         self.current_idx += 1
-        return {
-            'frame': frame, 'dt': dt_seconds, 'gyro': (gyro_x, gyro_y),
-            'ground_truth_v': (true_vx, true_vy), 'agl_height': true_z_height
-        }
-
+        return img_left, img_right
 
 # =============================================================================
-# 3. ROTATION COMPENSATION & OPTICAL FLOW
+# 3. STEREO SGBM (Semi-Global Block Matching) MOTORU
 # =============================================================================
-def generate_grid_features(frame, step=20):
-    h, w = frame.shape[:2]
-    y, x = np.mgrid[10:h - 10:step, 10:w - 10:step].reshape(2, -1).astype(int)
-    return np.array(list(zip(x, y)), dtype=np.float32).reshape(-1, 1, 2)
+def init_stereo_matcher():
+    """
+    Sol ve Sağ kameralar arasındaki yatay piksel kaymasını (Disparity) hesaplar.
+    Bu parametreler işlemciyi çok yormayacak şekilde endüstri standardı olan SGBM için ayarlandı.
+    """
+    window_size = 5 # Eşleştirilecek piksel bloğunun boyutu (5x5). Ne kadar küçükse o kadar detaylı ama gürültülü olur.
+    min_disp = 0    # Minimum kayma miktarı (Sonsuzdaki nesneler 0 kayar)
+    num_disp = 16 * 4 # Maksimum arayacağı kayma miktarı (16'nın katı olmak zorundadır). Derinlik sınırını belirler.
+    
+    stereo = cv.StereoSGBM_create(
+        minDisparity=min_disp,
+        numDisparities=num_disp,
+        blockSize=window_size,
+        P1=8 * 1 * window_size ** 2,    # P1 ve P2 derinlik pürüzsüzlüğünü (smoothness) kontrol eden ceza parametreleridir.
+        P2=32 * 1 * window_size ** 2,
+        disp12MaxDiff=1, # Sol ve Sağ eşleştirmesi arasındaki maksimum tolerans
+        uniquenessRatio=10, # Yanlış eşleşmeleri filtreleme sertliği
+        speckleWindowSize=100, # Gürültü (speckle) lekelerini silme penceresi
+        speckleRange=32
+    )
+    return stereo
 
-
+# =============================================================================
+# 4. ANA DÖNGÜ
+# =============================================================================
 def main():
-    dataset = EurocDataLoader()
-    data = dataset.get_next_frame_data()
-    if data is None: return
-
-    # ZEMİN ROI KESİMİ
-    h_raw, w_raw = data['frame'].shape
-    roi_top = int(h_raw * CONFIG['ROI_TOP_CROP_PERCENT'])
-
-    old_gray = data['frame'][roi_top:h_raw, 0:w_raw]
-    p0 = generate_grid_features(old_gray, step=30)
+    loader = StereoDataLoader()
+    stereo_matcher = init_stereo_matcher()
 
     while True:
-        data = dataset.get_next_frame_data()
-        if data is None: break
+        img_left, img_right = loader.get_stereo_pair()
+        if img_left is None:
+            print("[SİSTEM] Veri Seti Bitti.")
+            break
+            
+        # 1. Disparity'yi Hesapla
+        # SGBM algoritması her zaman 16 ile çarpılmış bir matris döndürür. (OpenCV'nin veri yapısı gereği)
+        disparity_16S = stereo_matcher.compute(img_left, img_right)
+        
+        # 2. Gerçek Piksel Kaymasına Çevir (16'ya bölerek)
+        disparity_float = disparity_16S.astype(np.float32) / 16.0
+        
+        # 3. İnsan Gözünün Görebilmesi İçin Görselleştirme (Normalize etme)
+        # Disparity değerlerini 0 (Siyah) ile 255 (Beyaz) arasına sıkıştırıyoruz.
+        # Açık renk (Beyaz) = Çok kaymış = KAMERAYA ÇOK YAKIN
+        # Koyu renk (Siyah) = Az kaymış = KAMERADAN ÇOK UZAK
+        disp_vis = cv.normalize(disparity_float, None, alpha=0, beta=255, norm_type=cv.NORM_MINMAX, dtype=cv.CV_8U)
+        
+        # Daha havalı bir endüstriyel görünüm için renk haritası (ColorMap) uygulayalım
+        disp_color = cv.applyColorMap(disp_vis, cv.COLORMAP_JET)
 
-        frame_full = data['frame']
-        frame_gray = frame_full[roi_top:h_raw, 0:w_raw]  # Sadece zemin
-        dt = data['dt']
-        gyro_x, gyro_y = data['gyro']
-        true_vx, true_vy = data['ground_truth_v']
-        agl = data['agl_height']
+        # Kameraları ve Derinliği yan yana göster
+        cv.imshow('Sol Kamera (Cam0)', img_left)
+        cv.imshow('Derinlik (Disparity Map)', disp_color)
 
-        vis_frame = cv.cvtColor(frame_full, cv.COLOR_GRAY2BGR)
-        cv.rectangle(vis_frame, (0, roi_top), (w_raw, h_raw), (0, 50, 0), 2)  # Analiz alanını çiz
-
-        if p0 is None or len(p0) < 10:
-            p0 = generate_grid_features(frame_gray, step=30)
-            old_gray = frame_gray.copy()
-            continue
-
-        p1, st, err = cv.calcOpticalFlowPyrLK(old_gray, frame_gray, p0, None, **CONFIG['LK_PARAMS'])
-
-        if p1 is not None:
-            good_new = p1[st == 1]
-            good_old = p0[st == 1]
-
-            if len(good_new) < 4:
-                p0 = generate_grid_features(frame_gray, step=30)
-                old_gray = frame_gray.copy()
-                continue
-
-            M, mask = cv.findHomography(good_old, good_new, cv.RANSAC, CONFIG['RANSAC_THRESHOLD'])
-
-            if M is not None:
-                matchesMask = mask.ravel().tolist()
-                inlier_dx, inlier_dy = [], []
-
-                for i, (new, old) in enumerate(zip(good_new, good_old)):
-                    if matchesMask[i]:
-                        inlier_dx.append(new[0] - old[0])
-                        inlier_dy.append(new[1] - old[1])
-                        # Görselleştirmede noktaları doğru yere çizmek için roi_top ekliyoruz
-                        cv.line(vis_frame, (int(new[0]), int(new[1] + roi_top)), (int(old[0]), int(old[1] + roi_top)),
-                                (0, 255, 0), 1)
-
-                if len(inlier_dx) > 0:
-                    mean_dx = np.mean(inlier_dx)
-                    mean_dy = np.mean(inlier_dy)
-
-                    # 1. HAM HIZ (Piksel/sn)
-                    v_px_raw_x = mean_dx / dt
-                    v_px_raw_y = mean_dy / dt
-
-                    # 2. GYRO ROTASYON ETKİSİ
-                    # DİKKAT: Bu işaretler test edilip değiştirilecek!
-                    v_px_rot_x = gyro_x * CONFIG['FOCAL_LENGTH_PX']
-                    v_px_rot_y = gyro_y * CONFIG['FOCAL_LENGTH_PX']
-
-                    # 3. DÜZELTİLMİŞ PİKSEL HIZI (Translation)
-                    v_px_trans_x = v_px_raw_x - v_px_rot_x
-                    v_px_trans_y = v_px_raw_y - v_px_rot_y
-
-                    # 4. METRİK HIZ (Fiziği oturtuyoruz)
-                    # Zemin hacki yaptığımız için, piksellerin kayması derinliğe (AGL) bağlıdır.
-                    # Eğer drone ileri giderse, zemin pikselleri EKSİ Y (aşağı) kayar. Bu yüzden -1 ile çarpıyoruz.
-                    est_vy = -1 * (v_px_trans_y * agl) / CONFIG['FOCAL_LENGTH_PX']
-                    est_vx = (v_px_trans_x * agl) / CONFIG['FOCAL_LENGTH_PX']
-
-                    # Ekrana Yazdır
-                    cv.putText(vis_frame, f"Tahmin Ileri Hiz: {est_vy:.2f} m/s", (20, 30), cv.FONT_HERSHEY_SIMPLEX, 0.6,
-                               (0, 255, 0), 2)
-                    cv.putText(vis_frame, f"Gercek Ileri Hiz (X): {true_vx:.2f} m/s", (20, 60), cv.FONT_HERSHEY_SIMPLEX,
-                               0.6, (0, 0, 255), 2)
-
-                    error = abs(est_vy - true_vx)
-                    cv.putText(vis_frame, f"HATA: {error:.2f} m/s", (20, 100), cv.FONT_HERSHEY_SIMPLEX, 0.6,
-                               (0, 255, 255), 2)
-
-                old_gray = frame_gray.copy()
-                p0 = good_new.reshape(-1, 1, 2)
-            else:
-                old_gray = frame_gray.copy()
-                p0 = good_new.reshape(-1, 1, 2)
-        else:
-            p0 = generate_grid_features(frame_gray, step=30)
-            old_gray = frame_gray.copy()
-
-        cv.imshow('TUSAS - Floor ROI Sensor Fusion', vis_frame)
-        if cv.waitKey(1) & 0xff == 27: break
+        if cv.waitKey(30) & 0xff == 27: # ESC ile çıkış
+            break
 
     cv.destroyAllWindows()
-
 
 if __name__ == "__main__":
     main()
