@@ -4,7 +4,7 @@ import pandas as pd
 import os
 
 # =============================================================================
-# 1. KONFİGÜRASYON
+# 1. KONFİGÜRASYON VE KALİBRASYON
 # =============================================================================
 CONFIG = {
     'CAM0_CSV': 'cam0/data.csv',
@@ -25,6 +25,18 @@ CONFIG = {
 K = np.array([[CONFIG['FOCAL_LENGTH_PX'], 0, CONFIG['CX']],
               [0, CONFIG['FOCAL_LENGTH_PX'], CONFIG['CY']],
               [0, 0, 1]], dtype=np.float64)
+
+# EuRoC cam0 -> IMU Extrinsic Matrisi (T_BS)
+T_BS = np.array([
+    [0.0148655429818, -0.999880929698, 0.00414029679422, -0.0216401454975],
+    [0.999557249008, 0.0149672133247, 0.025715529948, -0.064676986768],
+    [-0.0257744366974, 0.00375618835797, 0.999660727108, 0.00981073058949],
+    [0.0, 0.0, 0.0, 1.0]
+], dtype=np.float64)
+
+# Rotation Matrisini (3x3) ayır ve Body'den Sensor'e (Kameraya) geçiş için Transpozunu al (R_CB)
+R_BS = T_BS[:3, :3]
+R_CB = R_BS.T
 
 # =============================================================================
 # 2. VIO DATA LOADER
@@ -57,17 +69,23 @@ class VIODataLoader:
         
         imu_idx = (np.abs(self.imu_df['#timestamp [ns]'] - t_cam)).argmin()
         imu_row = self.imu_df.iloc[imu_idx]
-        gyro_cam_x = -imu_row['w_RS_S_y [rad s^-1]'] 
-        gyro_cam_y = -imu_row['w_RS_S_z [rad s^-1]']
-        gyro_cam_z = imu_row['w_RS_S_x [rad s^-1]']
-        gyro_vector = np.array([gyro_cam_x, gyro_cam_y, gyro_cam_z])
+        
+        # IMU'dan gelen ham Body Frame Jiroskop verisi
+        w_B = np.array([
+            imu_row['w_RS_S_x [rad s^-1]'],
+            imu_row['w_RS_S_y [rad s^-1]'],
+            imu_row['w_RS_S_z [rad s^-1]']
+        ], dtype=np.float64)
+        
+        # --- İŞTE GERÇEK MÜHENDİSLİK: Matris Çarpımı ile Kamera Eksenine Çevir ---
+        gyro_vector_cam = R_CB @ w_B
         
         gt_idx = (np.abs(self.gt_df['#timestamp'] - t_cam)).argmin()
         gt_row = self.gt_df.iloc[gt_idx]
         true_speed = np.sqrt(gt_row['v_RS_R_x [m s^-1]']**2 + gt_row['v_RS_R_y [m s^-1]']**2 + gt_row['v_RS_R_z [m s^-1]']**2)
 
         self.current_idx += 1
-        return img_left, img_right, dt_seconds, gyro_vector, true_speed
+        return img_left, img_right, dt_seconds, gyro_vector_cam, true_speed
 
 # =============================================================================
 # 3. WLS STEREO MATCHER
@@ -87,7 +105,6 @@ def main():
     loader = VIODataLoader()
     left_matcher, right_matcher, wls_filter = init_wls_stereo_matcher()
     
-    # Durum Değişkenleri (State Variables)
     need_new_keyframe = True
     kf_obj_pts_3d = []
     kf_img_pts_2d = []
@@ -98,26 +115,18 @@ def main():
     while True:
         data = loader.get_frame_data()
         if data is None: break
-        curr_left, curr_right, dt, gyro_vector, true_speed = data
+        curr_left, curr_right, dt, gyro_vector_cam, true_speed = data
         vis_frame = cv.cvtColor(curr_left, cv.COLOR_GRAY2BGR)
 
-        # -----------------------------------------------------------------
-        # ANA KARE (KEYFRAME) OLUŞTURMA
-        # -----------------------------------------------------------------
         if need_new_keyframe:
-            # 1. Yeni noktalar bul
             old_p0 = cv.goodFeaturesToTrack(curr_left, mask=None, maxCorners=150, qualityLevel=0.1, minDistance=7)
-            
-            # 2. Sadece bu karede derinlik hesapla
             left_disp = left_matcher.compute(curr_left, curr_right)
             right_disp = right_matcher.compute(curr_right, curr_left)
             disp_map = wls_filter.filter(left_disp, curr_left, None, right_disp).astype(np.float32) / 16.0
             
             kf_obj_pts_3d = []
-            kf_img_pts_2d = []
             valid_p0 = []
             
-            # 3. Noktaları 3B Uzaya Çivile
             if old_p0 is not None:
                 for pt in old_p0:
                     u, v = int(pt[0][0]), int(pt[0][1])
@@ -129,13 +138,11 @@ def main():
                             Y = (v - CONFIG['CY']) * Z / CONFIG['FOCAL_LENGTH_PX']
                             if Z < 15.0:
                                 kf_obj_pts_3d.append([X, Y, Z])
-                                kf_img_pts_2d.append([u, v])
                                 valid_p0.append(pt)
 
             kf_obj_pts_3d = np.array(kf_obj_pts_3d, dtype=np.float64)
             old_p0 = np.array(valid_p0, dtype=np.float32)
             
-            # Değişkenleri sıfırla
             kf_time_elapsed = 0.0
             kf_gyro_accum = np.zeros(3, dtype=np.float64)
             need_new_keyframe = False
@@ -146,22 +153,16 @@ def main():
             cv.waitKey(10)
             continue
 
-        # -----------------------------------------------------------------
-        # NORMAL KARELER (Sadece Takip ve Hız Çıkarımı)
-        # -----------------------------------------------------------------
         kf_time_elapsed += dt
-        kf_gyro_accum += gyro_vector * dt # Jiroskop verisini entegre et
+        kf_gyro_accum += gyro_vector_cam * dt # Matrisle düzeltilmiş Jiroskop verisini entegre et
         
-        # 1. Noktaları yeni karede takip et
         curr_p1, st, err = cv.calcOpticalFlowPyrLK(old_left, curr_left, old_p0, None, **CONFIG['LK_PARAMS'])
-        
         good_new = curr_p1[st == 1]
         good_old_3d = kf_obj_pts_3d[st.flatten() == 1]
         
         for pt in good_new:
             cv.circle(vis_frame, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
 
-        # 2. PnP Çözümü (Ana Kare Haritası vs Anlık 2B Pozisyonlar)
         est_speed = 0.0
         if len(good_old_3d) >= 10:
             success, rvec, tvec, inliers = cv.solvePnPRansac(
@@ -173,26 +174,18 @@ def main():
             )
             
             if success:
-                # tvec, Ana Kare'den bu yana toplam metrik yer değiştirmedir
                 translation_magnitude = np.linalg.norm(tvec)
-                
-                # Stabilize Hız = Toplam Yer Değiştirme / Toplam Geçen Zaman
                 if kf_time_elapsed > 0:
                     est_speed = translation_magnitude / kf_time_elapsed
                 
-                # Ekrana Bilgileri Bas
                 cv.putText(vis_frame, f"Stabil VIO Hiz : {est_speed:.2f} m/s", (20, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv.putText(vis_frame, f"Gercek Hiz (GT): {true_speed:.2f} m/s", (20, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 error = abs(est_speed - true_speed)
                 cv.putText(vis_frame, f"HATA           : {error:.2f} m/s", (20, 90), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                cv.putText(vis_frame, f"Keyframe Suresi: {kf_time_elapsed:.2f} sn", (20, 120), cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        # 3. Ana Kareyi Yenileme Koşulları (Karar Mekanizması)
-        # Eğer takip edilen nokta sayısı çok düştüyse veya Ana Kare'den çok uzaklaştıysak
         if len(good_old_3d) < 30 or kf_time_elapsed > 0.4:
             need_new_keyframe = True
         else:
-            # Döngüyü bir sonraki adım için hazırla
             old_p0 = good_new.reshape(-1, 1, 2)
             kf_obj_pts_3d = good_old_3d
             old_left = curr_left.copy()
