@@ -5,6 +5,9 @@ import os
 from config import CONFIG, K, R_CB
 from eskf import ESKF
 
+# =============================================================================
+# 1. VIO DATA LOADER (Accel + Gyro)
+# =============================================================================
 class VIODataLoader:
     def __init__(self):
         df0 = pd.read_csv(CONFIG['CAM0_CSV'], names=['timestamp', 'filename'], header=0)
@@ -21,7 +24,8 @@ class VIODataLoader:
         self.total_frames = len(self.stereo_df)
 
     def get_frame_data(self):
-        if self.current_idx >= self.total_frames - 1: return None
+        if self.current_idx >= self.total_frames - 1:
+            return None
         row = self.stereo_df.iloc[self.current_idx]
         t_cam = row['timestamp']
         t_next = self.stereo_df.iloc[self.current_idx + 1]['timestamp']
@@ -33,6 +37,7 @@ class VIODataLoader:
         imu_idx = (np.abs(self.imu_df['#timestamp [ns]'] - t_cam)).argmin()
         imu_row = self.imu_df.iloc[imu_idx]
         
+        # Ham veriyi Kamera Eksenine Çevir
         w_B = np.array([imu_row['w_RS_S_x [rad s^-1]'], imu_row['w_RS_S_y [rad s^-1]'], imu_row['w_RS_S_z [rad s^-1]']])
         gyro_cam = R_CB @ w_B
         
@@ -46,6 +51,9 @@ class VIODataLoader:
         self.current_idx += 1
         return img_left, img_right, dt_seconds, accel_cam, gyro_cam, true_speed
 
+# =============================================================================
+# 2. WLS STEREO MATCHER
+# =============================================================================
 def init_wls_stereo_matcher():
     left_matcher = cv.StereoSGBM_create(minDisparity=0, numDisparities=80, blockSize=5, P1=200, P2=800, disp12MaxDiff=1, uniquenessRatio=15, speckleWindowSize=100, speckleRange=32, mode=cv.STEREO_SGBM_MODE_SGBM_3WAY)
     right_matcher = cv.ximgproc.createRightMatcher(left_matcher)
@@ -54,14 +62,18 @@ def init_wls_stereo_matcher():
     wls_filter.setSigmaColor(1.5)
     return left_matcher, right_matcher, wls_filter
 
+# =============================================================================
+# 3. ANA DÖNGÜ (FRONTEND + BACKEND ENTEGRASYONU)
+# =============================================================================
 def main():
     loader = VIODataLoader()
     left_matcher, right_matcher, wls_filter = init_wls_stereo_matcher()
-    filter_eskf = ESKF() 
+    filter_eskf = ESKF() # Kalman Filtresini Başlat
     
     need_new_keyframe = True
     kf_obj_pts_3d = []
     kf_gyro_accum = np.zeros(3, dtype=np.float64)
+    kf_time_elapsed = 0.0 # EKSİK OLAN ZAMAN TUTUCU
     old_left = None
 
     while True:
@@ -70,10 +82,14 @@ def main():
         curr_left, curr_right, dt, accel_cam, gyro_cam, true_speed = data
         vis_frame = cv.cvtColor(curr_left, cv.COLOR_GRAY2BGR)
 
-        # ESKF PREDICT (Daima Çalışır)
+        # -----------------------------------------------------------------
+        # ESKF PREDICT (Daima Çalışır - Yüksek Frekans)
+        # -----------------------------------------------------------------
         filter_eskf.predict(accel_cam, gyro_cam, dt)
 
+        # -----------------------------------------------------------------
         # ANA KARE (KEYFRAME) OLUŞTURMA
+        # -----------------------------------------------------------------
         if need_new_keyframe:
             old_p0 = cv.goodFeaturesToTrack(curr_left, mask=None, maxCorners=150, qualityLevel=0.1, minDistance=7)
             left_disp = left_matcher.compute(curr_left, curr_right)
@@ -99,17 +115,26 @@ def main():
             kf_obj_pts_3d = np.array(kf_obj_pts_3d, dtype=np.float64)
             old_p0 = np.array(valid_p0, dtype=np.float32)
             
-            filter_eskf.p = np.zeros(3)
+            # Keyframe başlangıcında zamanı ve dönüş birikimini sıfırla
             kf_gyro_accum = np.zeros(3, dtype=np.float64)
+            kf_time_elapsed = 0.0 
+            
             need_new_keyframe = False
             old_left = curr_left.copy()
             continue
 
+        # -----------------------------------------------------------------
         # OPTİK AKIŞ VE PNP UPDATE
+        # -----------------------------------------------------------------
+        kf_time_elapsed += dt
         kf_gyro_accum += gyro_cam * dt
+        
         curr_p1, st, err = cv.calcOpticalFlowPyrLK(old_left, curr_left, old_p0, None, **CONFIG['LK_PARAMS'])
         good_new = curr_p1[st == 1]
         good_old_3d = kf_obj_pts_3d[st.flatten() == 1]
+        
+        for pt in good_new:
+            cv.circle(vis_frame, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
 
         if len(good_old_3d) >= 10:
             success, rvec, tvec, inliers = cv.solvePnPRansac(
@@ -120,16 +145,25 @@ def main():
                 flags=cv.SOLVEPNP_ITERATIVE, iterationsCount=100, reprojectionError=2.0
             )
             
-            if success:
-                # ESKF UPDATE
-                filter_eskf.update_with_pnp(tvec, dt)
-                kalman_speed = filter_eskf.get_speed()
+            if success and kf_time_elapsed > 0:
+                # 1. PnP'nin ürettiği yer değiştirmeyi hıza çevir
+                v_cam_measured = tvec.flatten() / kf_time_elapsed
                 
+                # 2. Kameradaki hızı IMU'nun eksenine döndür
+                v_imu_measured = R_CB.T @ v_cam_measured
+                
+                # 3. ESKF'ye HIZ Ölçümü olarak enjekte et
+                filter_eskf.update_velocity(v_imu_measured)
+                
+                # Ekran Çıktıları
+                kalman_speed = filter_eskf.get_speed()
                 cv.putText(vis_frame, f"ESKF Hiz: {kalman_speed:.2f} m/s", (20, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv.putText(vis_frame, f"GT Hiz  : {true_speed:.2f} m/s", (20, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                cv.putText(vis_frame, f"HATA    : {abs(kalman_speed - true_speed):.2f} m/s", (20, 90), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                error = abs(kalman_speed - true_speed)
+                cv.putText(vis_frame, f"HATA    : {error:.2f} m/s", (20, 90), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        if len(good_old_3d) < 30:
+        # Yenileme Koşulu
+        if len(good_old_3d) < 30 or kf_time_elapsed > 0.4:
             need_new_keyframe = True
         else:
             old_p0 = good_new.reshape(-1, 1, 2)
