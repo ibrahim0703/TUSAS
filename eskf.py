@@ -11,31 +11,21 @@ class ESKF:
         self.g = np.array([0, 0, -9.81]) 
 
         self.P = np.eye(15) * 0.1 
-        self.Q = np.eye(15) * 0.005 # IMU gürültüsü
-        self.R_cam = np.diag([2.0, 2.0, 5.0]) # Kameraya güven katsayısı
+        self.Q = np.eye(15) * 0.005 
+        self.R_cam = np.diag([2.0, 2.0, 5.0]) 
 
     def initialize_system(self, accel_samples, gyro_samples):
-        """
-        [EKSİK OLAN GERÇEK FİZİK] 
-        Filtre başlamadan önce ivmeölçerin okuduğu yerçekimi vektörünü bulup, 
-        dünyanın neresinin "Aşağı" olduğunu matrislere öğretir.
-        """
-        # Gyro'nun fabrika hatasını (Bias) bul ve sıfırla
         self.bg = np.mean(gyro_samples, axis=0)
-        
-        # Yerçekimi vektörünün yönünü bul
         a_mean = np.mean(accel_samples, axis=0)
-        z_axis = a_mean / np.linalg.norm(a_mean) # Z ekseni yerçekimine hizalandı
+        z_axis = a_mean / np.linalg.norm(a_mean) 
         
-        # X ve Y eksenlerini ortogonal (dik) olarak oluştur
         x_axis = np.array([1.0, 0.0, 0.0])
         x_axis = x_axis - z_axis * np.dot(x_axis, z_axis)
         x_axis /= np.linalg.norm(x_axis)
         y_axis = np.cross(z_axis, x_axis)
         
-        # Başlangıç Dönüş Matrisini (R) Kusursuzlaştır
         self.R = np.vstack((x_axis, y_axis, z_axis)).T
-        print("[SİSTEM] Yerçekimi Hizalaması ve Bias Temizliği Tamamlandı!")
+        print("[SİSTEM] Yerçekimi Hizalaması Tamamlandı!")
 
     def predict(self, accel, gyro, dt):
         if dt <= 0: return
@@ -67,8 +57,14 @@ class ESKF:
         
         error_state = K_gain @ innovation
         
+        # --- İŞTE EKSİK OLAN VE HIZI 20 M/S'YE ÇIKARAN FİZİK BURADA ---
         self.p += error_state[0:3]
         self.v += error_state[3:6]
+        
+        # Kameradan gelen ölçümle, IMU'nun ısınmadan kaynaklı sapmalarını da GERÇEK ZAMANLI düzelt!
+        self.bg += error_state[9:12] 
+        self.ba += error_state[12:15]
+        
         self.P = (np.eye(15) - K_gain @ H) @ self.P
 
     def get_speed(self):
