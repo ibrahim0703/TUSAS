@@ -50,9 +50,6 @@ class VIODataLoader:
         self.current_idx += 1
         return img_left, img_right, dt_seconds, accel_cam, gyro_cam, true_speed
 
-# =============================================================================
-# 2. WLS STEREO MATCHER
-# =============================================================================
 def init_wls_stereo_matcher():
     left_matcher = cv.StereoSGBM_create(minDisparity=0, numDisparities=80, blockSize=5, P1=200, P2=800, disp12MaxDiff=1, uniquenessRatio=15, speckleWindowSize=100, speckleRange=32, mode=cv.STEREO_SGBM_MODE_SGBM_3WAY)
     right_matcher = cv.ximgproc.createRightMatcher(left_matcher)
@@ -61,13 +58,24 @@ def init_wls_stereo_matcher():
     wls_filter.setSigmaColor(1.5)
     return left_matcher, right_matcher, wls_filter
 
-# =============================================================================
-# 3. ANA DÖNGÜ (FRONTEND + BACKEND)
-# =============================================================================
 def main():
     loader = VIODataLoader()
     left_matcher, right_matcher, wls_filter = init_wls_stereo_matcher()
     filter_eskf = ESKF() 
+    
+    # -----------------------------------------------------------------
+    # EKSİK OLAN GERÇEK FİZİK: SENSÖR ISITMA VE HİZALAMA FAZI
+    # -----------------------------------------------------------------
+    print("[SİSTEM] Sensörler ısınıyor, Yerçekimi hizalanıyor. Bekleyin...")
+    accel_buffer, gyro_buffer = [], []
+    for _ in range(15): # İlk 15 kareyi (~0.7 saniye) veriyi toplamak için kullan
+        data = loader.get_frame_data()
+        if data is None: return
+        accel_buffer.append(data[3])
+        gyro_buffer.append(data[4])
+    
+    filter_eskf.initialize_system(np.array(accel_buffer), np.array(gyro_buffer))
+    print("[SİSTEM] Hizalama Tamamlandı. VIO Döngüsü Başlıyor!")
     
     need_new_keyframe = True
     kf_obj_pts_3d = []
@@ -81,14 +89,8 @@ def main():
         curr_left, curr_right, dt, accel_cam, gyro_cam, true_speed = data
         vis_frame = cv.cvtColor(curr_left, cv.COLOR_GRAY2BGR)
 
-        # -----------------------------------------------------------------
-        # ESKF PREDICT (Daima Çalışır)
-        # -----------------------------------------------------------------
         filter_eskf.predict(accel_cam, gyro_cam, dt)
 
-        # -----------------------------------------------------------------
-        # ANA KARE OLUŞTURMA
-        # -----------------------------------------------------------------
         if need_new_keyframe:
             old_p0 = cv.goodFeaturesToTrack(curr_left, mask=None, maxCorners=150, qualityLevel=0.1, minDistance=7)
             left_disp = left_matcher.compute(curr_left, curr_right)
@@ -116,14 +118,10 @@ def main():
             
             kf_gyro_accum = np.zeros(3, dtype=np.float64)
             kf_time_elapsed = 0.0 
-            
             need_new_keyframe = False
             old_left = curr_left.copy()
             continue
 
-        # -----------------------------------------------------------------
-        # OPTİK AKIŞ VE PNP UPDATE
-        # -----------------------------------------------------------------
         kf_time_elapsed += dt
         kf_gyro_accum += gyro_cam * dt
         
@@ -144,12 +142,26 @@ def main():
             )
             
             if success and kf_time_elapsed > 0:
-                v_cam_measured = tvec.flatten() / kf_time_elapsed
+                # -----------------------------------------------------------------
+                # İŞTE KÖTÜ VEKTÖR MATEMATİĞİNİN DÜZELTİLDİĞİ YER
+                # -----------------------------------------------------------------
+                # 1. Rotasyon Vektörünü (rvec) 3x3 Matrise çevir
+                R_pnp, _ = cv.Rodrigues(rvec)
+                
+                # 2. PnP'nin ters dünyasını düzelt: P_cam = -R^T * tvec
+                # Bu bize kameranın Keyframe uzayındaki GERÇEK konumunu verir.
+                t_cam_kf = -R_pnp.T @ tvec
+                
+                # 3. Kameranın Gövde Hızını Bul
+                v_cam_measured = t_cam_kf.flatten() / kf_time_elapsed
+                
+                # 4. Kamera Ekseninden -> IMU Gövde Eksenine geç
                 v_imu_body = R_CB.T @ v_cam_measured
                 
-                # İŞTE O MATEMATİKSEL KÖPRÜ: Gövde Hızını DÜNYA Hızına Çevir
+                # 5. Gövde Ekseninden -> Dünya Eksenine geç
                 v_world_measured = filter_eskf.R @ v_imu_body
                 
+                # Ve HIZI FİLTREYE BESLE!
                 filter_eskf.update_velocity(v_world_measured)
                 
                 kalman_speed = filter_eskf.get_speed()
@@ -158,7 +170,6 @@ def main():
                 error = abs(kalman_speed - true_speed)
                 cv.putText(vis_frame, f"HATA    : {error:.2f} m/s", (20, 90), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        # Yenileme Koşulu
         if len(good_old_3d) < 30 or kf_time_elapsed > 0.4:
             need_new_keyframe = True
         else:
