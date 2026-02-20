@@ -10,15 +10,11 @@ class ESKF:
         self.ba = np.zeros(3) 
         self.g = np.array([0, 0, -9.81]) 
 
-        # Kovaryans (Belirsizlik) Matrisi
+        # Kovaryans ve Gürültü Matrisleri
         self.P = np.eye(15) * 0.1 
-        
-        # SİSTEM GÜRÜLTÜSÜ (Q) - IMU'ya ne kadar GÜVENMİYORUZ?
         self.Q = np.eye(15) * 0.001
         
-        # ÖLÇÜM GÜRÜLTÜSÜ (R_cam) - PnP Kameraya ne kadar GÜVENMİYORUZ?
-        # Sayıları devasa şekilde artırdım (0.1'den 5.0'a). 
-        # Çünkü kamera gürültülüyse, filtre hızı aniden fırlatmamalıdır!
+        # Kameraya Güven Katsayısı (Sağırlaştırdık ki hatalara fırlamasın)
         self.R_cam = np.diag([5.0, 5.0, 10.0]) 
 
     def predict(self, accel, gyro, dt):
@@ -26,7 +22,7 @@ class ESKF:
         accel_true = accel - self.ba
         gyro_true = gyro - self.bg
         
-        # 1. Fizik Entegrasyonu
+        # Fizik Entegrasyonu
         accel_world = self.R @ accel_true + self.g
         self.p = self.p + self.v * dt + 0.5 * accel_world * (dt ** 2)
         self.v = self.v + accel_world * dt
@@ -39,35 +35,32 @@ class ESKF:
             R_delta = np.eye(3) + np.sin(theta) * K_skew + (1 - np.cos(theta)) * (K_skew @ K_skew)
             self.R = self.R @ R_delta
 
-        # -------------------------------------------------------------
-        # 2. İŞTE EKSİK OLAN HAYATİ MATEMATİK: STATE TRANSITION (F MATRİSİ)
-        # -------------------------------------------------------------
-        # F matrisi, sistemin birbiriyle olan fiziksel ilişkisidir.
+        # State Transition (F Matrisi) - Pozisyon, hızdan etkilenir
         F = np.eye(15)
-        
-        # Pozisyon (0:3), Hızdan (3:6) 'dt' kadar etkilenir. ( p = p + v*dt )
         F[0:3, 3:6] = np.eye(3) * dt
         
-        # Belirsizliği (Kovaryans) F matrisi ile ilerlet: P = F * P * F^T + Q
+        # Belirsizliği İlerlet
         self.P = F @ self.P @ F.T + self.Q
 
-    def update_with_pnp(self, pnp_translation, dt):
-        innovation = pnp_translation.flatten() - self.p
+    def update_velocity(self, measured_velocity):
+        """
+        Kameradan DÜNYA EKSENİNDE (World Frame) gelen 3 Boyutlu Hız ile filtreyi düzeltir.
+        """
+        innovation = measured_velocity.flatten() - self.v
         
+        # H (Gözlem) Matrisi Hıza (3:6) bakar
         H = np.zeros((3, 15))
-        H[:, 0:3] = np.eye(3)
+        H[:, 3:6] = np.eye(3)
         
-        # Kalman Kazancı Hesaplama
+        # Kalman Kazancı
         S = H @ self.P @ H.T + self.R_cam 
         K_gain = self.P @ H.T @ np.linalg.inv(S) 
         
-        # Hata Durumunu Hesapla ve Enjekte Et
         error_state = K_gain @ innovation
         
         self.p += error_state[0:3]
         self.v += error_state[3:6]
         
-        # Belirsizliği Güncelle
         self.P = (np.eye(15) - K_gain @ H) @ self.P
 
     def get_speed(self):
