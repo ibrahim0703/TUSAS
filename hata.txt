@@ -1,4 +1,18 @@
-https://hal.science/hal-00939204/document
+import tartanair as ta
 
+# 1. Verilerin ineceği ana klasörü belirliyoruz (Bulunduğun dizine açar)
+tartanair_data_root = './tartanair_sample'
+ta.init(tartanair_data_root)
 
-https://tartanair.org/examples.html#download-example
+print("[SİSTEM] TartanAir İndirme İşlemi Başlıyor...")
+
+# 2. Sadece ihtiyacımız olan spesifik veriyi çekiyoruz
+ta.download(
+    env=['ArchVizTinyHouseDay'],                # Sadece tek bir simülasyon ortamı
+    difficulty=['easy'],                        # Sadece kolay/yavaş uçuş rotası
+    modality=['image'],                         # Sadece RGB Pikseller (Derinlik, IMU, Lidar İSTEMİYORUZ)
+    camera_name=['lcam_front', 'rcam_front'],   # Sadece Sol ve Sağ Ön Kamera
+    unzip=True                                  # İndirdikten sonra ZIP'ten çıkar
+)
+
+print("[SİSTEM] İndirme Tamamlandı. Klasörleri Kontrol Et.")
