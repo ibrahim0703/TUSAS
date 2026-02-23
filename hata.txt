@@ -1,0 +1,16 @@
+$ python main.py
+[S▒STEM] Sensorler isiniyor, lutfen bekleyin...
+[ESKF] Tam Donanimli Hizalama ve Bias Baslatmasi Tamamlandi!
+[S▒STEM] VIO Basladi. 200 Hz IMU Entegrasyonu ve Eksen Donusumleri Devrede.
+Traceback (most recent call last):
+  File "C:\Users\A12540\Desktop\a\main.py", line 283, in <module>
+    main()
+  File "C:\Users\A12540\Desktop\a\main.py", line 261, in main
+    filter_eskf.update_velocity(v_world_measured)
+  File "C:\Users\A12540\Desktop\a\eskf.py", line 91, in update_velocity
+    K_gain = self.P @ H.T @ np.linalg.inv(S)
+  File "C:\Users\A12540\AppData\Roaming\Python\Python310\site-packages\numpy\linalg\_linalg.py", line 609, in inv
+    ainv = _umath_linalg.inv(a, signature=signature)
+  File "C:\Users\A12540\AppData\Roaming\Python\Python310\site-packages\numpy\linalg\_linalg.py", line 104, in _raise_linalgerror_singular
+    raise LinAlgError("Singular matrix")
+numpy.linalg.LinAlgError: Singular matrix
