@@ -1,15 +1,1 @@
-import urllib.request
-import os
-
-print("[SİSTEM] OpenCV Resmi Stereo Test Goruntuleri Indiriliyor...")
-
-# OpenCV'nin resmi eğitim fotoğrafları (Kusursuz rektifiye edilmiş Stereo Çifti)
-url_left = "https://raw.githubusercontent.com/opencv/opencv/master/samples/data/aloeL.jpg"
-url_right = "https://raw.githubusercontent.com/opencv/opencv/master/samples/data/aloeR.jpg"
-
-try:
-    urllib.request.urlretrieve(url_left, "left.png")
-    urllib.request.urlretrieve(url_right, "right.png")
-    print("[SİSTEM] Indirme Basarili! Klasorde 'left.png' ve 'right.png' dosyalarini gorebilirsin.")
-except Exception as e:
-    print(f"[HATA] Baglanti sorunu: {e}")
+https://docs.px4.io/main/en/sensor/optical_flow
