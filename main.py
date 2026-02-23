@@ -6,7 +6,7 @@ from config import CONFIG, K, R_CB
 from eskf import ESKF
 
 # =============================================================================
-# 1. EUROC KALİBRASYON (STEREO RECTIFICATION)
+# 1. EUROC KALİBRASYON 
 # =============================================================================
 K0 = np.array([[458.654, 0.0, 367.215], [0.0, 457.296, 248.375], [0.0, 0.0, 1.0]])
 D0 = np.array([-0.28340811, 0.07395907, 0.00019359, 1.76187114e-05])
@@ -15,14 +15,15 @@ D1 = np.array([-0.28368365, 0.07451284, -0.00010473, -3.55590700e-05])
 R_stereo = np.array([[0.999997, 0.002521, -0.000670], [-0.002519, 0.999993, 0.002758], [0.000677, -0.002757, 0.999996]])
 T_stereo = np.array([-0.110074, 0.000399, -0.000853])
 
+# FİZİKSEL DÜZELTME 2: Kaldıraç Kolu (Gövde'den Cam0'a olan mesafe)
+# EuRoC veri seti standart T_BS (Body to Sensor) matrisinden alınmıştır.
+T_BC = np.array([-0.0216, -0.0646, 0.0098])
+
 image_size = (752, 480)
 R1, R2, P1, P2, Q, roi1, roi2 = cv.stereoRectify(K0, D0, K1, D1, image_size, R_stereo, T_stereo, alpha=0)
 map1_x, map1_y = cv.initUndistortRectifyMap(K0, D0, R1, P1, image_size, cv.CV_32FC1)
 map2_x, map2_y = cv.initUndistortRectifyMap(K1, D1, R2, P2, image_size, cv.CV_32FC1)
 
-# =============================================================================
-# 2. FULL VIO DATA LOADER
-# =============================================================================
 class VIODataLoader:
     def __init__(self):
         df0 = pd.read_csv(CONFIG['CAM0_CSV'], names=['timestamp', 'filename'], header=0)
@@ -40,10 +41,8 @@ class VIODataLoader:
 
     def get_frame_data(self):
         if self.current_idx >= self.total_frames: return None
-        
         row_curr = self.stereo_df.iloc[self.current_idx]
         t_cam_curr = row_curr['timestamp']
-        
         if self.current_idx == 0:
             t_cam_prev = t_cam_curr - int(0.05 * 1e9) 
         else:
@@ -64,9 +63,6 @@ class VIODataLoader:
         self.current_idx += 1
         return rect_left, rect_right, imu_batch, true_speed
 
-# =============================================================================
-# 3. GÖRÜNTÜ İŞLEME FONKSİYONLARI
-# =============================================================================
 def init_wls_stereo_matcher():
     left_matcher = cv.StereoSGBM_create(
         minDisparity=0, numDisparities=128, blockSize=11, 
@@ -103,9 +99,6 @@ def get_distributed_features(img, max_corners=300, grid_size=(4, 4)):
     if len(distributed_pts) == 0: return None
     return np.array(distributed_pts, dtype=np.float32).reshape(-1, 1, 2)
 
-# =============================================================================
-# 4. MASTER VIO DÖNGÜSÜ
-# =============================================================================
 def main():
     loader = VIODataLoader()
     left_matcher, right_matcher, wls_filter = init_wls_stereo_matcher()
@@ -123,12 +116,14 @@ def main():
             accel_buffer.append(R_CB @ a_B)
             
     filter_eskf.initialize_system(np.array(accel_buffer), np.array(gyro_buffer))
-    print("[SİSTEM] VIO Basladi. Rasyonel EPnP Devrede.")
+    print("[SİSTEM] VIO Basladi. Dinamik Q Matrisi ve Lever Arm Devrede.")
     
     need_new_keyframe = True
     kf_obj_pts_3d = []
-    kf_time_elapsed = 0.0 
+    
+    kf_p_world = np.zeros(3)
     kf_R_WB = np.eye(3) 
+    
     old_left = None
     old_p0 = None
 
@@ -138,19 +133,14 @@ def main():
         curr_left, curr_right, imu_batch, true_speed = data
         vis_frame = cv.cvtColor(curr_left, cv.COLOR_GRAY2BGR)
 
-        # ---------------------------------------------------------------------
         # 1. ESKF SÜREKLİ TAHMİN (PREDICT)
-        # ---------------------------------------------------------------------
         last_imu_time = None
         for index, imu_row in imu_batch.iterrows():
             current_imu_time = imu_row['#timestamp [ns]']
-            
             if last_imu_time is None:
                 last_imu_time = current_imu_time - int(0.005 * 1e9)
-                
             dt_imu = (current_imu_time - last_imu_time) / 1e9
-            if dt_imu <= 0 or dt_imu > 0.1: 
-                dt_imu = 0.005 
+            if dt_imu <= 0 or dt_imu > 0.1: dt_imu = 0.005 
             
             w_B = np.array([imu_row['w_RS_S_x [rad s^-1]'], imu_row['w_RS_S_y [rad s^-1]'], imu_row['w_RS_S_z [rad s^-1]']])
             gyro_cam = R_CB @ w_B
@@ -158,13 +148,9 @@ def main():
             accel_cam = R_CB @ a_B
             
             filter_eskf.predict(accel_cam, gyro_cam, dt_imu)
-            
-            kf_time_elapsed += dt_imu
             last_imu_time = current_imu_time
 
-        # ---------------------------------------------------------------------
-        # 2. ANA KARE OLUŞTURMA
-        # ---------------------------------------------------------------------
+        # 2. ANA KARE OLUŞTURMA (KEYFRAME)
         if need_new_keyframe:
             old_p0 = get_distributed_features(curr_left, max_corners=300)
             if old_p0 is not None:
@@ -190,15 +176,14 @@ def main():
                 kf_obj_pts_3d = np.array(kf_obj_pts_3d, dtype=np.float64)
                 old_p0 = np.array(valid_p0, dtype=np.float32).reshape(-1, 1, 2)
                 
-                kf_time_elapsed = 0.0 
+                kf_p_world = filter_eskf.p.copy()
                 kf_R_WB = filter_eskf.R.copy()
+                
                 need_new_keyframe = False
                 old_left = curr_left.copy()
             continue
 
-        # ---------------------------------------------------------------------
         # 3. OPTİK AKIŞ VE EPIPOLAR KORUMA
-        # ---------------------------------------------------------------------
         curr_p1, st, err = cv.calcOpticalFlowPyrLK(old_left, curr_left, old_p0, None, **CONFIG['LK_PARAMS'])
         good_new_raw = curr_p1[st == 1]
         good_old_2d_raw = old_p0[st.flatten() == 1] 
@@ -218,11 +203,8 @@ def main():
         for pt in good_new:
             cv.circle(vis_frame, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
 
-        # ---------------------------------------------------------------------
-        # 4. KUSURSUZ PNP ÇÖZÜMÜ VE ESKF GÜNCELLEME
-        # ---------------------------------------------------------------------
+        # 4. KUSURSUZ PNP VE ESKF KONUM GÜNCELLEMESİ
         if len(good_old_3d) >= 15: 
-            # FİZİKSEL KİLİT 3: useExtrinsicGuess kapatıldı. Yanlış yönlendirme bitti. EPNP kullanılıyor.
             success, rvec, tvec, inliers = cv.solvePnPRansac(
                 good_old_3d, good_new, K, None, 
                 useExtrinsicGuess=False,              
@@ -230,20 +212,30 @@ def main():
                 reprojectionError=2.0
             )
             
-            if success and kf_time_elapsed > 0.01: # Küçük zaman aralıklarında hız patlamasını engelle
+            if success:
                 R_pnp, _ = cv.Rodrigues(rvec)
+                
+                # Kamera eksenindeki öteleme
                 t_cam_kf = -R_pnp.T @ tvec
                 
-                v_cam_measured = (t_cam_kf.flatten() / kf_time_elapsed) 
+                # Gövde eksenine çevir
+                t_body_kf = R_CB.T @ t_cam_kf.flatten()
                 
-                v_body_measured = R_CB.T @ v_cam_measured
-                v_world_measured = kf_R_WB @ v_body_measured
+                # Dünya eksenine çevir
+                t_world = kf_R_WB @ t_body_kf
                 
-                speed_measured = np.linalg.norm(v_world_measured)
-                if speed_measured < 8.0:
-                    filter_eskf.update_velocity(v_world_measured)
+                # Kameranın dünyadaki mutlak konumu
+                p_cam_world = kf_p_world + t_world
+                
+                # KALDIRAÇ KOLU İPTALİ: Kameranın konumundan Gövdenin (IMU) konumunu bul!
+                p_imu_measured = p_cam_world - (filter_eskf.R @ T_BC)
+                
+                # Sadece mantıklı konum sıçramalarını kabul et (PnP hatası koruması)
+                dist_moved = np.linalg.norm(t_world)
+                if dist_moved < 1.0: # İki kare arasında (0.05 sn) 1 metreden fazla gidemez
+                    filter_eskf.update_position(p_imu_measured)
                 else:
-                    print(f"[UYARI] PnP Spikes: {speed_measured:.2f} m/s reddedildi. Filtre korundu.")
+                    print(f"[UYARI] PnP Spike (Mesafe): {dist_moved:.2f} m reddedildi.")
                 
                 kalman_speed = filter_eskf.get_speed()
                 error = abs(kalman_speed - true_speed)
@@ -252,7 +244,7 @@ def main():
                 cv.putText(vis_frame, f"GT Hiz  : {true_speed:.2f} m/s", (20, 60), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 cv.putText(vis_frame, f"HATA    : {error:.2f} m/s", (20, 90), cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-        if len(good_old_3d) < 30 or kf_time_elapsed > 0.4:
+        if len(good_old_3d) < 30:
             need_new_keyframe = True
         else:
             old_p0 = good_new.reshape(-1, 1, 2)
