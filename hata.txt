@@ -1,18 +1,15 @@
-import tartanair as ta
+import urllib.request
+import os
 
-# 1. Verilerin ineceği ana klasörü belirliyoruz (Bulunduğun dizine açar)
-tartanair_data_root = './tartanair_sample'
-ta.init(tartanair_data_root)
+print("[SİSTEM] OpenCV Resmi Stereo Test Goruntuleri Indiriliyor...")
 
-print("[SİSTEM] TartanAir İndirme İşlemi Başlıyor...")
+# OpenCV'nin resmi eğitim fotoğrafları (Kusursuz rektifiye edilmiş Stereo Çifti)
+url_left = "https://raw.githubusercontent.com/opencv/opencv/master/samples/data/aloeL.jpg"
+url_right = "https://raw.githubusercontent.com/opencv/opencv/master/samples/data/aloeR.jpg"
 
-# 2. Sadece ihtiyacımız olan spesifik veriyi çekiyoruz
-ta.download(
-    env=['ArchVizTinyHouseDay'],                # Sadece tek bir simülasyon ortamı
-    difficulty=['easy'],                        # Sadece kolay/yavaş uçuş rotası
-    modality=['image'],                         # Sadece RGB Pikseller (Derinlik, IMU, Lidar İSTEMİYORUZ)
-    camera_name=['lcam_front', 'rcam_front'],   # Sadece Sol ve Sağ Ön Kamera
-    unzip=True                                  # İndirdikten sonra ZIP'ten çıkar
-)
-
-print("[SİSTEM] İndirme Tamamlandı. Klasörleri Kontrol Et.")
+try:
+    urllib.request.urlretrieve(url_left, "left.png")
+    urllib.request.urlretrieve(url_right, "right.png")
+    print("[SİSTEM] Indirme Basarili! Klasorde 'left.png' ve 'right.png' dosyalarini gorebilirsin.")
+except Exception as e:
+    print(f"[HATA] Baglanti sorunu: {e}")
