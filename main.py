@@ -21,7 +21,7 @@ map1_x, map1_y = cv.initUndistortRectifyMap(K0, D0, R1, P1, image_size, cv.CV_32
 map2_x, map2_y = cv.initUndistortRectifyMap(K1, D1, R2, P2, image_size, cv.CV_32FC1)
 
 # =============================================================================
-# 2. FULL VIO DATA LOADER (200 HZ IMU BATCH PROCESSING)
+# 2. FULL VIO DATA LOADER
 # =============================================================================
 class VIODataLoader:
     def __init__(self):
@@ -104,7 +104,7 @@ def get_distributed_features(img, max_corners=300, grid_size=(4, 4)):
     return np.array(distributed_pts, dtype=np.float32).reshape(-1, 1, 2)
 
 # =============================================================================
-# 4. MASTER VIO DÖNGÜSÜ (ESKF + VISION)
+# 4. MASTER VIO DÖNGÜSÜ
 # =============================================================================
 def main():
     loader = VIODataLoader()
@@ -123,11 +123,10 @@ def main():
             accel_buffer.append(R_CB @ a_B)
             
     filter_eskf.initialize_system(np.array(accel_buffer), np.array(gyro_buffer))
-    print("[SİSTEM] VIO Basladi. Zaman duzeltmesi ve Filtre Koruma (Outlier Rejection) Devrede.")
+    print("[SİSTEM] VIO Basladi. Rasyonel EPnP Devrede.")
     
     need_new_keyframe = True
     kf_obj_pts_3d = []
-    kf_gyro_accum = np.zeros(3, dtype=np.float64)
     kf_time_elapsed = 0.0 
     kf_R_WB = np.eye(3) 
     old_left = None
@@ -143,7 +142,6 @@ def main():
         # 1. ESKF SÜREKLİ TAHMİN (PREDICT)
         # ---------------------------------------------------------------------
         last_imu_time = None
-        
         for index, imu_row in imu_batch.iterrows():
             current_imu_time = imu_row['#timestamp [ns]']
             
@@ -156,34 +154,23 @@ def main():
             
             w_B = np.array([imu_row['w_RS_S_x [rad s^-1]'], imu_row['w_RS_S_y [rad s^-1]'], imu_row['w_RS_S_z [rad s^-1]']])
             gyro_cam = R_CB @ w_B
-            
             a_B = np.array([imu_row['a_RS_S_x [m s^-2]'], imu_row['a_RS_S_y [m s^-2]'], imu_row['a_RS_S_z [m s^-2]']])
             accel_cam = R_CB @ a_B
             
             filter_eskf.predict(accel_cam, gyro_cam, dt_imu)
             
-            kf_gyro_accum += gyro_cam * dt_imu
             kf_time_elapsed += dt_imu
             last_imu_time = current_imu_time
 
         # ---------------------------------------------------------------------
-        # 2. ANA KARE OLUŞTURMA VE DERİNLİK (KEYFRAME)
+        # 2. ANA KARE OLUŞTURMA
         # ---------------------------------------------------------------------
         if need_new_keyframe:
             old_p0 = get_distributed_features(curr_left, max_corners=300)
-            
             if old_p0 is not None:
                 left_disp = left_matcher.compute(curr_left, curr_right)
                 right_disp = right_matcher.compute(curr_right, curr_left)
                 disp_map = wls_filter.filter(left_disp, curr_left, None, right_disp).astype(np.float32) / 16.0
-                
-                disp_vis = np.zeros_like(disp_map, dtype=np.uint8)
-                mask = (disp_map > 0).astype(np.uint8) 
-                disp_clipped = np.clip(disp_map, 0, 64) 
-                cv.normalize(disp_clipped, disp_vis, alpha=0, beta=255, norm_type=cv.NORM_MINMAX, mask=mask)
-                color_disp = cv.applyColorMap(disp_vis, cv.COLORMAP_JET)
-                color_disp[mask == 0] = [0, 0, 0] 
-                cv.imshow('TUSAS - Derinlik Haritasi', color_disp)
                 
                 kf_obj_pts_3d = []
                 valid_p0 = []
@@ -196,7 +183,6 @@ def main():
                             Z = (458.654 * 0.110074) / d
                             X = (u - 367.215) * Z / 458.654
                             Y = (v - 248.375) * Z / 458.654
-                            
                             if 0.5 < Z < 30.0: 
                                 kf_obj_pts_3d.append([X, Y, Z])
                                 valid_p0.append(pt)
@@ -205,9 +191,7 @@ def main():
                 old_p0 = np.array(valid_p0, dtype=np.float32).reshape(-1, 1, 2)
                 
                 kf_time_elapsed = 0.0 
-                kf_gyro_accum = np.zeros(3, dtype=np.float64)
                 kf_R_WB = filter_eskf.R.copy()
-                
                 need_new_keyframe = False
                 old_left = curr_left.copy()
             continue
@@ -216,7 +200,6 @@ def main():
         # 3. OPTİK AKIŞ VE EPIPOLAR KORUMA
         # ---------------------------------------------------------------------
         curr_p1, st, err = cv.calcOpticalFlowPyrLK(old_left, curr_left, old_p0, None, **CONFIG['LK_PARAMS'])
-        
         good_new_raw = curr_p1[st == 1]
         good_old_2d_raw = old_p0[st.flatten() == 1] 
         good_old_3d_raw = kf_obj_pts_3d[st.flatten() == 1]
@@ -236,18 +219,18 @@ def main():
             cv.circle(vis_frame, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
 
         # ---------------------------------------------------------------------
-        # 4. PNP ÇÖZÜMÜ VE ESKF GÜNCELLEME (UPDATE)
+        # 4. KUSURSUZ PNP ÇÖZÜMÜ VE ESKF GÜNCELLEME
         # ---------------------------------------------------------------------
         if len(good_old_3d) >= 15: 
+            # FİZİKSEL KİLİT 3: useExtrinsicGuess kapatıldı. Yanlış yönlendirme bitti. EPNP kullanılıyor.
             success, rvec, tvec, inliers = cv.solvePnPRansac(
                 good_old_3d, good_new, K, None, 
-                useExtrinsicGuess=True,              
-                rvec=kf_gyro_accum.reshape(3,1),     
-                tvec=np.zeros((3,1)),                
-                flags=cv.SOLVEPNP_ITERATIVE, reprojectionError=2.0
+                useExtrinsicGuess=False,              
+                flags=cv.SOLVEPNP_EPNP, 
+                reprojectionError=2.0
             )
             
-            if success and kf_time_elapsed > 0:
+            if success and kf_time_elapsed > 0.01: # Küçük zaman aralıklarında hız patlamasını engelle
                 R_pnp, _ = cv.Rodrigues(rvec)
                 t_cam_kf = -R_pnp.T @ tvec
                 
@@ -256,7 +239,6 @@ def main():
                 v_body_measured = R_CB.T @ v_cam_measured
                 v_world_measured = kf_R_WB @ v_body_measured
                 
-                # FİZİKSEL KİLİT 2: OUTLIER REJECTION
                 speed_measured = np.linalg.norm(v_world_measured)
                 if speed_measured < 8.0:
                     filter_eskf.update_velocity(v_world_measured)
@@ -278,7 +260,7 @@ def main():
             old_left = curr_left.copy()
 
         cv.imshow('TUSAS - Master VIO', vis_frame)
-        if cv.waitKey(10) & 0xff == 27: break
+        if cv.waitKey(1) & 0xff == 27: break
 
     cv.destroyAllWindows()
 
