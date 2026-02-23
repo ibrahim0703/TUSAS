@@ -44,7 +44,6 @@ class VIODataLoader:
         row_curr = self.stereo_df.iloc[self.current_idx]
         t_cam_curr = row_curr['timestamp']
         
-        # Bir önceki kameranın zamanını bul (IMU aralığını hesaplamak için)
         if self.current_idx == 0:
             t_cam_prev = t_cam_curr - int(0.05 * 1e9) 
         else:
@@ -55,7 +54,6 @@ class VIODataLoader:
         rect_left = cv.remap(raw_left, map1_x, map1_y, cv.INTER_LINEAR)
         rect_right = cv.remap(raw_right, map2_x, map2_y, cv.INTER_LINEAR)
         
-        # Önceki kare ile şu anki kare arasında kalan TÜM 200Hz IMU verilerini çek
         imu_mask = (self.imu_df['#timestamp [ns]'] > t_cam_prev) & (self.imu_df['#timestamp [ns]'] <= t_cam_curr)
         imu_batch = self.imu_df[imu_mask]
         
@@ -115,7 +113,6 @@ def main():
     
     print("[SİSTEM] Sensorler isiniyor, lutfen bekleyin...")
     accel_buffer, gyro_buffer = [], []
-    # Statik kalibrasyon için ilk 2 kameranın IMU verilerini topla (Yaklaşık 20 veri)
     for _ in range(2): 
         data = loader.get_frame_data()
         if data is None: return
@@ -126,7 +123,7 @@ def main():
             accel_buffer.append(R_CB @ a_B)
             
     filter_eskf.initialize_system(np.array(accel_buffer), np.array(gyro_buffer))
-    print("[SİSTEM] VIO Basladi. 200 Hz IMU Entegrasyonu ve Eksen Donusumleri Devrede.")
+    print("[SİSTEM] VIO Basladi. Zaman duzeltmesi ve Filtre Koruma (Outlier Rejection) Devrede.")
     
     need_new_keyframe = True
     kf_obj_pts_3d = []
@@ -143,14 +140,19 @@ def main():
         vis_frame = cv.cvtColor(curr_left, cv.COLOR_GRAY2BGR)
 
         # ---------------------------------------------------------------------
-        # 1. ESKF SÜREKLİ TAHMİN (PREDICT) - 200 Hz IMU BATCH İŞLEME
+        # 1. ESKF SÜREKLİ TAHMİN (PREDICT)
         # ---------------------------------------------------------------------
-        last_imu_time = imu_batch.iloc[0]['#timestamp [ns]'] if len(imu_batch) > 0 else 0
+        last_imu_time = None
         
         for index, imu_row in imu_batch.iterrows():
             current_imu_time = imu_row['#timestamp [ns]']
+            
+            if last_imu_time is None:
+                last_imu_time = current_imu_time - int(0.005 * 1e9)
+                
             dt_imu = (current_imu_time - last_imu_time) / 1e9
-            if dt_imu <= 0: dt_imu = 0.005 # Güvenlik önlemi (0 dt ile patlamaması için)
+            if dt_imu <= 0 or dt_imu > 0.1: 
+                dt_imu = 0.005 
             
             w_B = np.array([imu_row['w_RS_S_x [rad s^-1]'], imu_row['w_RS_S_y [rad s^-1]'], imu_row['w_RS_S_z [rad s^-1]']])
             gyro_cam = R_CB @ w_B
@@ -158,16 +160,14 @@ def main():
             a_B = np.array([imu_row['a_RS_S_x [m s^-2]'], imu_row['a_RS_S_y [m s^-2]'], imu_row['a_RS_S_z [m s^-2]']])
             accel_cam = R_CB @ a_B
             
-            # Kalman Filtresini ufak 0.005 sn'lik adımlarla ilerlet (Gerçek Fizik)
             filter_eskf.predict(accel_cam, gyro_cam, dt_imu)
             
-            # PnP algoritmasının ihtiyacı olan rotasyon ve zaman birikimini güncelle
             kf_gyro_accum += gyro_cam * dt_imu
             kf_time_elapsed += dt_imu
             last_imu_time = current_imu_time
 
         # ---------------------------------------------------------------------
-        # 2. ANA KARE OLUŞTURMA VE DERİNLİK (KEYFRAME) - 20 Hz
+        # 2. ANA KARE OLUŞTURMA VE DERİNLİK (KEYFRAME)
         # ---------------------------------------------------------------------
         if need_new_keyframe:
             old_p0 = get_distributed_features(curr_left, max_corners=300)
@@ -206,7 +206,7 @@ def main():
                 
                 kf_time_elapsed = 0.0 
                 kf_gyro_accum = np.zeros(3, dtype=np.float64)
-                kf_R_WB = filter_eskf.R.copy() # Dünya rotasyonunu mühürle
+                kf_R_WB = filter_eskf.R.copy()
                 
                 need_new_keyframe = False
                 old_left = curr_left.copy()
@@ -253,12 +253,15 @@ def main():
                 
                 v_cam_measured = (t_cam_kf.flatten() / kf_time_elapsed) 
                 
-                # Eksen Dönüşümü: Kamera -> Gövde -> Dünya
                 v_body_measured = R_CB.T @ v_cam_measured
                 v_world_measured = kf_R_WB @ v_body_measured
                 
-                # Filtreye hizalanmış gerçek dünya hızını (Ölçümü) veriyoruz
-                filter_eskf.update_velocity(v_world_measured)
+                # FİZİKSEL KİLİT 2: OUTLIER REJECTION
+                speed_measured = np.linalg.norm(v_world_measured)
+                if speed_measured < 8.0:
+                    filter_eskf.update_velocity(v_world_measured)
+                else:
+                    print(f"[UYARI] PnP Spikes: {speed_measured:.2f} m/s reddedildi. Filtre korundu.")
                 
                 kalman_speed = filter_eskf.get_speed()
                 error = abs(kalman_speed - true_speed)
