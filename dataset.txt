@@ -1,1 +1,2 @@
-https://www.cvlibs.net/datasets/kitti/raw_data.php
+https://github.com/hunjung-lim/awesome-vehicle-datasets/blob/master/vehicle/kitti/KITTI%2BDataset%2BExploration.ipynb
+
