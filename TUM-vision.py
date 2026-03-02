@@ -1,46 +1,57 @@
 import cv2
 import numpy as np
 
-class StereoRectifier:
+class StereoFlowTracker:
     def __init__(self):
-        # 1. İç Parametreler (Camera1 ve Camera2'den)
-        self.K_left = np.array([[190.978, 0.0, 254.931], [0.0, 190.973, 256.897], [0.0, 0.0, 1.0]])
-        self.D_left = np.array([0.003482, 0.000715, -0.002053, 0.0002029])
+        # --- 1. GFTT PARAMETRELERİ (Sol Kameradan Nokta Çıkarmak İçin) ---
+        # maxCorners: En fazla 200 nokta. Fazlası işlemciyi kilitler, azı geometrik hesabı zayıflatır.
+        # qualityLevel: 0.01. Kalitesi en yüksek noktanın %1'inden daha kötü olanları çöpe atar. (Gürültü engeller)
+        # minDistance: 15. İki nokta birbirine 15 pikselden daha yakın Olamaz! Bu, noktaların bir yere yığılmasını engeller, ekranı tarar.
+        self.feature_params = dict(maxCorners=200,
+                                   qualityLevel=0.01,
+                                   minDistance=15,
+                                   blockSize=3)
         
-        self.K_right = np.array([[190.442, 0.0, 252.597], [0.0, 190.434, 254.917], [0.0, 0.0, 1.0]])
-        self.D_right = np.array([0.003400, 0.001766, -0.002663, 0.0003299])
+        # --- 2. LUCAS-KANADE (OPTİK AKIŞ) PARAMETRELERİ (Sağ Kamerada Noktayı Bulmak İçin) ---
+        # winSize: (15, 15). Algoritma sol resimdeki noktayı, sağ resimde 15x15'lik bir pencere içinde arar.
+        # maxLevel: 2. Görüntü piramidi. Hızlı hareketlerde pikselleri kaçırmamak için resmi küçülterek de bakar.
+        self.lk_params = dict(winSize=(15, 15),
+                              maxLevel=2,
+                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
 
-        # 2. Dış Parametreler (camchain.yaml'dan T_cn_cnm1)
-        # Sağ kameranın Sol kameraya göre konumu (R ve T)
-        self.R = np.array([
-            [ 0.99999719,  0.00160241,  0.00174676],
-            [-0.00160269,  0.9999987 ,  0.00016067],
-            [-0.0017465 , -0.00016347,  0.99999846]
-        ])
-        self.T = np.array([-0.10093155, -0.00017163, -0.00067332]) # Baseline burada gizli (~10cm)
-
-        self.image_size = (512, 512)
-        
-        # 3. Rectification Matrislerini Sadece 1 Kere Hesapla (CPU tasarrufu)
-        self._init_rectification_maps()
-
-    def _init_rectification_maps(self):
-        # Fisheye Stereo Rectify (Sanal paralel düzlemleri oluşturur)
-        R1, R2, P1, P2, Q = cv2.fisheye.stereoRectify(
-            self.K_left, self.D_left, self.K_right, self.D_right, 
-            self.image_size, self.R, self.T, 
-            cv2.CALIB_ZERO_DISPARITY, (0, 0)
-        )
-        
-        # Piksellerin yeni yerlerinin haritasını çıkar
-        self.map1_l, self.map2_l = cv2.fisheye.initUndistortRectifyMap(self.K_left, self.D_left, R1, P1, self.image_size, cv2.CV_16SC2)
-        self.map1_r, self.map2_r = cv2.fisheye.initUndistortRectifyMap(self.K_right, self.D_right, R2, P2, self.image_size, cv2.CV_16SC2)
-
-    def process(self, img_left, img_right):
+    def get_stereo_matches(self, img_left_rect, img_right_rect):
         """
-        Girdi: Ham sol ve sağ resimler
-        Çıktı: Bükülmeleri giderilmiş ve Y-ekseninde kusursuz hizalanmış resimler
+        Sol ve Sağ HİZALANMIŞ resimleri alır. Sol resimdeki köşeleri bulup, Sağ resimde nereye gittiklerini söyler.
         """
-        rect_left = cv2.remap(img_left, self.map1_l, self.map2_l, cv2.INTER_LINEAR)
-        rect_right = cv2.remap(img_right, self.map1_r, self.map2_r, cv2.INTER_LINEAR)
-        return rect_left, rect_right
+        # Adım 1: Referans noktalarını sadece Sol kameradan çıkar
+        # Dönen p0_left boyutu: (N, 1, 2)
+        p0_left = cv2.goodFeaturesToTrack(img_left_rect, mask=None, **self.feature_params)
+        
+        # Eğer duvara çok yakınsak ve hiç köşe yoksa sistemi çökertmemek için kontrol
+        if p0_left is None:
+            return np.array([]), np.array([])
+
+        # Adım 2: Sol kameradaki noktaları (p0_left), Sağ kamerada Optik Akış ile bul
+        # p1_right: Sağ resimdeki yeni konumlar.
+        # status (st): Nokta bulunduysa 1, bulunamadıysa 0.
+        p1_right, st, err = cv2.calcOpticalFlowPyrLK(img_left_rect, img_right_rect, p0_left, None, **self.lk_params)
+
+        # Adım 3: Sıkı Filtreleme (Sadece Başarılı ve Mantıklı Noktaları Al)
+        good_left = []
+        good_right = []
+        
+        for i, (right_pt, left_pt) in enumerate(zip(p1_right, p0_left)):
+            if st[i] == 1: # Optik Akış "noktayı buldum" diyorsa...
+                xl, yl = left_pt.ravel() # ravel(), o gereksiz (N, 1, 2) boyutunu düz (x,y) yapar
+                xr, yr = right_pt.ravel()
+                
+                # ADIM 4: EPIPOLAR KONTROL (En Kritik Aşama)
+                # Aşama 1'de görüntüleri yatayda kusursuz hizaladık. 
+                # O zaman Sol kameradaki Y değeri ile Sağ kameradaki Y değeri milimetrik AYNI olmalıdır.
+                # Eğer 1 pikselden fazla sapma varsa, algoritma yanlış noktayı bulmuştur! Acımasızca atıyoruz.
+                if abs(yl - yr) < 1.0: 
+                    good_left.append((xl, yl))
+                    good_right.append((xr, yr))
+
+        # Hesaplama kolaylığı için Numpy dizisine çevirip geri döndür
+        return np.float32(good_left), np.float32(good_right)
