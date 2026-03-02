@@ -1,57 +1,75 @@
 import cv2
 import numpy as np
 
-class StereoFlowTracker:
-    def __init__(self):
-        # --- 1. GFTT PARAMETRELERİ (Sol Kameradan Nokta Çıkarmak İçin) ---
-        # maxCorners: En fazla 200 nokta. Fazlası işlemciyi kilitler, azı geometrik hesabı zayıflatır.
-        # qualityLevel: 0.01. Kalitesi en yüksek noktanın %1'inden daha kötü olanları çöpe atar. (Gürültü engeller)
-        # minDistance: 15. İki nokta birbirine 15 pikselden daha yakın Olamaz! Bu, noktaların bir yere yığılmasını engeller, ekranı tarar.
-        self.feature_params = dict(maxCorners=200,
-                                   qualityLevel=0.01,
-                                   minDistance=15,
-                                   blockSize=3)
+# NOT: Bu kodun çalışması için StereoRectifier ve StereoFlowTracker 
+# sınıflarının bu dosyanın üst kısmında tanımlanmış olması gerekir.
+
+def test_and_visualize_pipeline():
+    # 1. Sınıfları Başlat (Matrisler RAM'e yükleniyor)
+    print("[BİLGİ] Sistem başlatılıyor ve matrisler hesaplanıyor...")
+    rectifier = StereoRectifier()
+    tracker = StereoFlowTracker()
+
+    # 2. Resim Yolları (Kendi klasörüne göre BURAYI GÜNCELLE!)
+    # İkisi de aynı zaman damgasına (timestamp) sahip olmalı.
+    left_path = 'SVO_Veri/cam0/data/1520530308199447626.png'
+    right_path = 'SVO_Veri/cam1/data/1520530308199447626.png'
+
+    img_left_raw = cv2.imread(left_path, cv2.IMREAD_GRAYSCALE)
+    img_right_raw = cv2.imread(right_path, cv2.IMREAD_GRAYSCALE)
+
+    if img_left_raw is None or img_right_raw is None:
+        print("[HATA] Resimler okunamadı! Dosya yollarını kontrol et.")
+        return
+
+    # 3. Aşama 1: Kusursuz Hizalama (Rectification)
+    img_left_rect, img_right_rect = rectifier.process(img_left_raw, img_right_raw)
+
+    # 4. Aşama 2: Stereo Eşleştirme (Optical Flow)
+    good_left, good_right = tracker.get_stereo_matches(img_left_rect, img_right_rect)
+    
+    print(f"[SONUÇ] Epipolar testten geçen BAŞARILI eşleşme sayısı: {len(good_left)}")
+
+    if len(good_left) == 0:
+        print("[HATA] Hiç nokta eşleşmedi. Sistemi kontrol et.")
+        return
+
+    # =========================================================================
+    # 5. GÖRSELLEŞTİRME (VİSUALİZATİON) MODÜLÜ
+    # =========================================================================
+    
+    # Renkli çizim yapabilmek için siyah-beyaz resimleri BGR'a çeviriyoruz
+    vis_left = cv2.cvtColor(img_left_rect, cv2.COLOR_GRAY2BGR)
+    vis_right = cv2.cvtColor(img_right_rect, cv2.COLOR_GRAY2BGR)
+
+    # İki resmi yan yana yapıştır (512x512 iki resim -> 1024x512 tek resim olur)
+    vis_combined = np.hstack((vis_left, vis_right))
+    w = vis_left.shape[1] # Sol resmin genişliği (512). Sağ resme çizgi çekerken X'e eklenecek.
+
+    # Her bir eşleşen nokta çifti için çizim yap
+    for i in range(len(good_left)):
+        pt_l = (int(good_left[i][0]), int(good_left[i][1]))
+        pt_r = (int(good_right[i][0]) + w, int(good_right[i][1])) # Sağdaki noktanın X'ini sağa kaydır
+
+        # Sol noktayı KIRMIZI çiz
+        cv2.circle(vis_combined, pt_l, 4, (0, 0, 255), -1)
+        # Sağ noktayı YEŞİL çiz
+        cv2.circle(vis_combined, pt_r, 4, (0, 255, 0), -1)
         
-        # --- 2. LUCAS-KANADE (OPTİK AKIŞ) PARAMETRELERİ (Sağ Kamerada Noktayı Bulmak İçin) ---
-        # winSize: (15, 15). Algoritma sol resimdeki noktayı, sağ resimde 15x15'lik bir pencere içinde arar.
-        # maxLevel: 2. Görüntü piramidi. Hızlı hareketlerde pikselleri kaçırmamak için resmi küçülterek de bakar.
-        self.lk_params = dict(winSize=(15, 15),
-                              maxLevel=2,
-                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+        # İki nokta arasına SARI çizgi çek
+        cv2.line(vis_combined, pt_l, pt_r, (0, 255, 255), 1)
 
-    def get_stereo_matches(self, img_left_rect, img_right_rect):
-        """
-        Sol ve Sağ HİZALANMIŞ resimleri alır. Sol resimdeki köşeleri bulup, Sağ resimde nereye gittiklerini söyler.
-        """
-        # Adım 1: Referans noktalarını sadece Sol kameradan çıkar
-        # Dönen p0_left boyutu: (N, 1, 2)
-        p0_left = cv2.goodFeaturesToTrack(img_left_rect, mask=None, **self.feature_params)
-        
-        # Eğer duvara çok yakınsak ve hiç köşe yoksa sistemi çökertmemek için kontrol
-        if p0_left is None:
-            return np.array([]), np.array([])
+    # İlk noktanın Derinlik (Z) hesabını ekrana yazdırıp test edelim
+    d = good_left[0][0] - good_right[0][0] # Disparity (X farkı)
+    if d > 0:
+        z = (190.978 * 0.1009) / d
+        print(f"[MATEMATİK] İlk noktanın piksel kayması (Disparity): {d:.2f} piksel")
+        print(f"[MATEMATİK] İlk noktanın kameraya uzaklığı (Derinlik): {z:.2f} metre")
 
-        # Adım 2: Sol kameradaki noktaları (p0_left), Sağ kamerada Optik Akış ile bul
-        # p1_right: Sağ resimdeki yeni konumlar.
-        # status (st): Nokta bulunduysa 1, bulunamadıysa 0.
-        p1_right, st, err = cv2.calcOpticalFlowPyrLK(img_left_rect, img_right_rect, p0_left, None, **self.lk_params)
+    # Görüntüyü ekrana bas
+    cv2.imshow("Stereo Eslesme ve Epipolar Cizgiler", vis_combined)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
 
-        # Adım 3: Sıkı Filtreleme (Sadece Başarılı ve Mantıklı Noktaları Al)
-        good_left = []
-        good_right = []
-        
-        for i, (right_pt, left_pt) in enumerate(zip(p1_right, p0_left)):
-            if st[i] == 1: # Optik Akış "noktayı buldum" diyorsa...
-                xl, yl = left_pt.ravel() # ravel(), o gereksiz (N, 1, 2) boyutunu düz (x,y) yapar
-                xr, yr = right_pt.ravel()
-                
-                # ADIM 4: EPIPOLAR KONTROL (En Kritik Aşama)
-                # Aşama 1'de görüntüleri yatayda kusursuz hizaladık. 
-                # O zaman Sol kameradaki Y değeri ile Sağ kameradaki Y değeri milimetrik AYNI olmalıdır.
-                # Eğer 1 pikselden fazla sapma varsa, algoritma yanlış noktayı bulmuştur! Acımasızca atıyoruz.
-                if abs(yl - yr) < 1.0: 
-                    good_left.append((xl, yl))
-                    good_right.append((xr, yr))
-
-        # Hesaplama kolaylığı için Numpy dizisine çevirip geri döndür
-        return np.float32(good_left), np.float32(good_right)
+if __name__ == "__main__":
+    test_and_visualize_pipeline()
