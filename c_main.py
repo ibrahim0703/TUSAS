@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import glob
 import os
-from tracker import StereoOdometryTracker
+from c_tracker import StereoOdometryTracker
 
 
 def load_imu_data(imu_csv_path):
@@ -154,36 +154,7 @@ def main():
         n_success += 1
         tx, ty, tz = float(tvec[0]), float(tvec[1]), float(tvec[2])
         log.write(f"{ts_t1},{tx:.6f},{ty:.6f},{tz:.6f},{speed:.4f},{len(inliers)},{int(imu_fused)}\n")
-
-        # --- Gorsellestirme ---
-        display = cv2.cvtColor(rect_L1, cv2.COLOR_GRAY2BGR)
-        for pt in p1_list:
-            cv2.circle(display, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
-        if inliers is not None:
-            for idx in inliers.ravel():
-                if idx < len(matched_2d):
-                    pt = matched_2d[idx]
-                    cv2.circle(display, (int(pt[0]), int(pt[1])), 6, (0, 0, 255), 1)
-
-        cv2.putText(display, f"Frame {i+1}/{len(left_images)}",
-                    (10, 25),  cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,255), 2)
-        cv2.putText(display, f"Speed: {speed:.3f} m/s",
-                    (10, 52),  cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,100,255), 2)
-        cv2.putText(display, f"Inliers: {len(inliers)}  Pts: {len(matched_3d)}",
-                    (10, 79),  cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,100,0), 2)
-        cv2.putText(display, f"IMU: {'ON' if imu_fused else 'OFF'}",
-                    (10, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                    (0,255,0) if imu_fused else (120,120,120), 2)
-        cv2.putText(display, f"tx={tx:.3f} ty={ty:.3f} tz={tz:.3f}",
-                    (10, 133), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
-
-        cv2.imshow("VIO - Stereo + IMU", display)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    log.close()
-    cv2.destroyAllWindows()
-
+        
     print("\n" + "="*50)
     print(f"  Toplam kare       : {n_total}")
     print(f"  Basarili tahmin   : {n_success}")
