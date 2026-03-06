@@ -1,1 +1,0 @@
-https://cvg.cit.tum.de/data/datasets/visual-inertial-dataset
