@@ -31,9 +31,9 @@ class KalmanVIO:
     """
 
     def __init__(self,
-                 sigma_accel:  float = 0.05,
-                 sigma_gyro:   float = 0.005,
-                 sigma_bias:   float = 0.001,
+                 sigma_accel:  float = 0.0396,     # accel_noise_density(0.0028) * sqrt(200 Hz)
+                 sigma_gyro:   float = 0.00226,    # gyro_noise_density(0.00016) * sqrt(200 Hz)
+                 sigma_bias:   float = 0.00000156, # gyro_random_walk(0.000022)  / sqrt(200 Hz)
                  sigma_vision: float = 0.02):
 
         self.n = 9
@@ -244,10 +244,16 @@ class StereoOdometryTracker:
 
         # ── IMU & Kalman ──────────────────────────────────────────────────────
         self.imu    = IMUPreintegrator()
+
+        # TUM-VI imu_config.yaml degerlerinden hesaplandi (200 Hz):
+        #   sigma_accel  = accel_noise_density(0.0028)  * sqrt(200) = 0.0396  m/s2
+        #   sigma_gyro   = gyro_noise_density(0.00016)  * sqrt(200) = 0.00226 rad/s
+        #   sigma_bias   = gyro_random_walk(0.000022)   / sqrt(200) = 1.56e-6 rad/s
+        #   sigma_vision = PnP reprojectionError(2px) kaynakli, elle ayarli
         self.kalman = KalmanVIO(
-            sigma_accel=0.05,
-            sigma_gyro=0.005,
-            sigma_bias=0.001,
+            sigma_accel=0.0396,
+            sigma_gyro=0.00226,
+            sigma_bias=0.00000156,
             sigma_vision=0.02
         )
 
