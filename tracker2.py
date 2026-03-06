@@ -1,6 +1,6 @@
 import cv2
 import numpy as np
-from config import K_LEFT, D_LEFT, K_RIGHT, D_RIGHT, R_MATRIX, T_VECTOR, BASELINE
+from config import k_left, d_left, k_right, d_right, r_matrix, t_vector, baseline
 
 class StereoOdometryTracker:
     def __init__(self):
@@ -10,7 +10,7 @@ class StereoOdometryTracker:
 
         # Sanal Projeksiyon Matrisleri
         self.R1, self.R2, self.P1, self.P2, _ = cv2.fisheye.stereoRectify(
-            K_LEFT, D_LEFT, K_RIGHT, D_RIGHT, (512, 512), R_MATRIX, T_VECTOR, flags=cv2.CALIB_ZERO_DISPARITY
+            k_left, d_left, k_right, d_right, (512, 512), r_matrix, t_vector, flags=cv2.CALIB_ZERO_DISPARITY
         )
         self.f_ideal = self.P1[0, 0]
 
@@ -28,8 +28,8 @@ class StereoOdometryTracker:
         raw_l_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
         raw_r_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
 
-        rect_l = cv2.fisheye.undistortPoints(raw_l_pts, K_LEFT, D_LEFT, R=self.R1, P=self.P1)
-        rect_r = cv2.fisheye.undistortPoints(raw_r_pts, K_RIGHT, D_RIGHT, R=self.R2, P=self.P2)
+        rect_l = cv2.fisheye.undistortPoints(raw_l_pts, k_left, d_left, R=self.R1, P=self.P1)
+        rect_r = cv2.fisheye.undistortPoints(raw_r_pts, k_right, d_right, R=self.R2, P=self.P2)
 
         valid_raw_l = []
         valid_3d_pts = []
@@ -44,7 +44,7 @@ class StereoOdometryTracker:
                 disp = xl - xr
                 # Disparity 2 pikselden büyük olmak ZORUNDA
                 if disp > 2.0:
-                    z = (self.f_ideal * BASELINE) / disp
+                    z = (self.f_ideal * baseline) / disp
                     
                     # Derinlik 0.5m ile 8.0m arasında olmak ZORUNDA
                     if 0.5 < z < 8.0:
@@ -91,8 +91,8 @@ class StereoOdometryTracker:
         success, rvec, tvec, inliers = cv2.solvePnPRansac(
             pts_3d_t0, 
             pts_2d_t1_raw, 
-            K_LEFT, 
-            D_LEFT,
+            k_left, 
+            d_left,
             reprojectionError=2.0, 
             confidence=0.99,
             flags=cv2.SOLVEPNP_EPNP
