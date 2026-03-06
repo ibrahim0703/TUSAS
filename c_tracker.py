@@ -43,12 +43,12 @@ class StereoOdometryTracker:
         self.imu  = IMUPreintegrator()
 
         # stereoRectify → 7 deger: R1, R2, P1, P2, Q, roi1, roi2
-        self.R1, self.R2, self.P1, self.P2, self.Q, _, _ = \
-            cv2.fisheye.stereoRectify(
+        result = cv2.fisheye.stereoRectify(
                 k_left, d_left, k_right, d_right,
                 (512, 512), r_matrix, t_vector,
                 flags=cv2.CALIB_ZERO_DISPARITY
             )
+        self.R1, self.R2, self.P1, self.P2, self.Q = result[:5] 
 
         self.f_ideal = self.P1[0, 0]
         self.K_rect  = self.P1[:3, :3]
