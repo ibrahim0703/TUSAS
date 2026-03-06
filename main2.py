@@ -98,8 +98,9 @@ def main():
         img_left_t0  = cv2.imread(left_images[i],    cv2.IMREAD_GRAYSCALE)
         img_right_t0 = cv2.imread(right_images[i],   cv2.IMREAD_GRAYSCALE)
         img_left_t1  = cv2.imread(left_images[i+1],  cv2.IMREAD_GRAYSCALE)
+        img_right_t1 = cv2.imread(right_images[i+1], cv2.IMREAD_GRAYSCALE)
 
-        if img_left_t0 is None or img_right_t0 is None or img_left_t1 is None:
+        if img_left_t0 is None or img_right_t0 is None or img_left_t1 is None or img_right_t1 is None:
             continue
 
         # ── ADIM 1: Stereo → Derinlik + Rectified noktalar ───────────────
@@ -126,11 +127,7 @@ def main():
                 imu_fused = True
 
         # ── ADIM 2: Optik akış (rectified uzayda) ────────────────────────
-        # rect_l_t1: t1 anının rectified görüntüsünü al
-        _, _, rect_l_t1 = tracker.process_space_get_depth(img_left_t1, img_right_t0)
-        # Not: rect_l_t1 hesaplamak için sağ görüntü lazım değil,
-        # sadece sol kanalın rectify'ını alıyoruz.
-        # Daha verimli yöntem: rectify map'i doğrudan uygula
+        # t1 sol görüntüsünü rectify et (map zaten ADIM 1'de hazırlandı)
         h, w = img_left_t1.shape[:2]
         tracker._ensure_maps(h, w)
         rect_l_t1_direct = cv2.remap(
