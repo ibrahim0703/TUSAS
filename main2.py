@@ -5,236 +5,194 @@ import os
 from tracker import StereoOdometryTracker
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# IMU veri okuyucu
-# ─────────────────────────────────────────────────────────────────────────────
 def load_imu_data(imu_csv_path):
-    """
-    TUM-VI imu0/data.csv formatını yükle.
-    Kolon sırası: timestamp[ns], wx, wy, wz, ax, ay, az
-    Döndürür: dict {timestamp_ns: (gyro[3], accel[3])}
-    """
+    """TUM-VI imu0/data.csv → dict {timestamp_ns: (gyro, accel)}"""
     imu_data = {}
     if not os.path.exists(imu_csv_path):
-        print(f"[UYARI] IMU dosyası bulunamadı: {imu_csv_path}")
-        print("[UYARI] Yalnızca vizyon tabanlı devam ediliyor.")
+        print(f"[UYARI] IMU dosyasi bulunamadi: {imu_csv_path}")
+        print("[UYARI] Yalnizca vizyon ile devam ediliyor.")
         return imu_data
-
     with open(imu_csv_path, 'r') as f:
         for line in f:
             line = line.strip()
-            if line.startswith('#') or line == '':
+            if line.startswith('#') or not line:
                 continue
             parts = line.split(',')
             if len(parts) < 7:
                 continue
-            ts   = int(parts[0])
+            ts    = int(parts[0])
             gyro  = np.array([float(parts[1]), float(parts[2]), float(parts[3])])
             accel = np.array([float(parts[4]), float(parts[5]), float(parts[6])])
             imu_data[ts] = (gyro, accel)
-
-    print(f"[IMU] {len(imu_data)} örnek yüklendi.")
+    print(f"[IMU] {len(imu_data)} ornek yuklendi.")
     return imu_data
 
 
-def get_imu_between(imu_data, ts_start_ns, ts_end_ns):
-    """ts_start ve ts_end arasındaki IMU örneklerini sıralı döndür."""
+def get_imu_between(imu_data, ts_start, ts_end):
     samples = [
-        (ts, gyro, accel)
-        for ts, (gyro, accel) in imu_data.items()
-        if ts_start_ns <= ts <= ts_end_ns
+        (ts, g, a) for ts, (g, a) in imu_data.items()
+        if ts_start <= ts <= ts_end
     ]
     return sorted(samples, key=lambda x: x[0])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Ana döngü
-# ─────────────────────────────────────────────────────────────────────────────
 def main():
-    print("[SYSTEM] VIO Pipeline başlatılıyor (Stereo + IMU)...")
+    print("[SYSTEM] VIO Pipeline baslatiliyor (Stereo + IMU)...")
     tracker = StereoOdometryTracker()
 
-    # ── Dosya yolları (kendi sistemine göre düzenle) ──────────────────────
+    # --- Dosya yollarini kendi sistemine gore ayarla ---
     left_images  = sorted(glob.glob('mav0/cam0/data/*.png'))
     right_images = sorted(glob.glob('mav0/cam1/data/*.png'))
-    imu_csv      = 'mav0/imu0/data.csv'     # TUM-VI standart yolu
+    imu_csv      = 'mav0/imu0/data.csv'
 
     if not left_images or not right_images:
-        print("[HATA] Görüntü bulunamadı. Dosya yollarını kontrol et.")
+        print("[HATA] Goruntu bulunamadi.")
         return
+
+    if len(left_images) != len(right_images):
+        print(f"[UYARI] Sol/sag goruntu sayisi eslesmedi: {len(left_images)} vs {len(right_images)}")
 
     imu_data = load_imu_data(imu_csv)
     use_imu  = len(imu_data) > 0
 
-    log_file = open("estimated_trajectory.csv", "w")
-    log_file.write("timestamp,tx,ty,tz,speed_m_s,inliers,imu_fused\n")
+    log = open("estimated_trajectory.csv", "w")
+    log.write("timestamp,tx,ty,tz,speed_m_s,inliers,imu_fused\n")
 
-    print(f"[SYSTEM] {len(left_images)} kare işlenecek. Çıkmak için 'q'.")
+    print(f"[SYSTEM] {len(left_images)} kare islenecek. Cikmak icin 'q'.")
 
-    # İlk kare için değişkenler
-    prev_rect_l = None
-    prev_pts    = None
-    prev_3d     = None
-    prev_ts_ns  = None
-
-    # İstatistik sayaçları
-    n_total   = 0
-    n_success = 0
-    n_skipped_speed  = 0
-    n_skipped_points = 0
+    n_total = n_success = n_skip_pts = n_skip_speed = 0
 
     for i in range(len(left_images) - 1):
         n_total += 1
 
-        # ── Timestamp ────────────────────────────────────────────────────
-        ts_t0_ns = int(os.path.basename(left_images[i]).split('.')[0])
-        ts_t1_ns = int(os.path.basename(left_images[i+1]).split('.')[0])
-        dt = (ts_t1_ns - ts_t0_ns) * 1e-9   # saniyeye çevir
-
+        # --- Zaman adimi ---
+        ts_t0 = int(os.path.basename(left_images[i]).split('.')[0])
+        ts_t1 = int(os.path.basename(left_images[i+1]).split('.')[0])
+        dt    = (ts_t1 - ts_t0) * 1e-9
         if dt <= 0:
             continue
 
-        # ── Görüntü yükle ────────────────────────────────────────────────
-        img_left_t0  = cv2.imread(left_images[i],    cv2.IMREAD_GRAYSCALE)
-        img_right_t0 = cv2.imread(right_images[i],   cv2.IMREAD_GRAYSCALE)
-        img_left_t1  = cv2.imread(left_images[i+1],  cv2.IMREAD_GRAYSCALE)
-        img_right_t1 = cv2.imread(right_images[i+1], cv2.IMREAD_GRAYSCALE)
+        # --- Goruntu yukle ---
+        L0 = cv2.imread(left_images[i],     cv2.IMREAD_GRAYSCALE)
+        R0 = cv2.imread(right_images[i],    cv2.IMREAD_GRAYSCALE)
+        L1 = cv2.imread(left_images[i+1],   cv2.IMREAD_GRAYSCALE)
+        R1 = cv2.imread(right_images[i+1],  cv2.IMREAD_GRAYSCALE)
 
-        if img_left_t0 is None or img_right_t0 is None or img_left_t1 is None or img_right_t1 is None:
+        if L0 is None or R0 is None or L1 is None or R1 is None:
+            print(f"[UYARI] Frame {i}: goruntu yuklenemedi, atlaniyor.")
             continue
 
-        # ── ADIM 1: Stereo → Derinlik + Rectified noktalar ───────────────
-        pts_t0, pts_3d_t0, rect_l_t0 = tracker.process_space_get_depth(
-            img_left_t0, img_right_t0
-        )
+        # --- ADIM 1: t0 stereo → derinlik + rectified noktalar ---
+        # process_space_get_depth her zaman 3 deger dondurur:
+        #   pts_rect (N,1,2) | pts_3d (N,3) | rect_l (goruntu)
+        pts_t0, pts_3d_t0, rect_L0 = tracker.process_space_get_depth(L0, R0)
 
         if len(pts_t0) < 6:
-            n_skipped_points += 1
+            n_skip_pts += 1
             continue
 
-        # ── IMU entegrasyonu (bu kare aralığındaki örnekler) ─────────────
+        # --- IMU entegrasyonu ---
         imu_fused = False
         if use_imu:
             tracker.imu.reset()
-            imu_samples = get_imu_between(imu_data, ts_t0_ns, ts_t1_ns)
-
-            if len(imu_samples) >= 2:
-                for j in range(len(imu_samples) - 1):
-                    ts_a, gyro_a, accel_a = imu_samples[j]
-                    ts_b, _,      _       = imu_samples[j+1]
-                    dt_imu = (ts_b - ts_a) * 1e-9
-                    tracker.imu.integrate(gyro_a, accel_a, dt_imu)
+            samples = get_imu_between(imu_data, ts_t0, ts_t1)
+            if len(samples) >= 2:
+                for j in range(len(samples) - 1):
+                    ts_a, g_a, a_a = samples[j]
+                    ts_b, _,   _   = samples[j+1]
+                    tracker.imu.integrate(g_a, a_a, (ts_b - ts_a) * 1e-9)
                 imu_fused = True
 
-        # ── ADIM 2: Optik akış (rectified uzayda) ────────────────────────
-        # t1 sol görüntüsünü rectify et (map zaten ADIM 1'de hazırlandı)
-        h, w = img_left_t1.shape[:2]
-        tracker._ensure_maps(h, w)
-        rect_l_t1_direct = cv2.remap(
-            img_left_t1, tracker._ml1, tracker._ml2, cv2.INTER_LINEAR
-        )
+        # --- ADIM 2: t1 sol goruntusunu rectify et ---
+        rect_L1 = tracker.rectify_image(L1, side='left')
 
-        p0_tracked, p1_tracked, _ = tracker.track_time_get_flow(
-            rect_l_t0, rect_l_t1_direct, pts_t0
-        )
+        # --- ADIM 3: Optical flow (rectified uzayda) ---
+        p0_list, p1_list, _ = tracker.track_time_get_flow(rect_L0, rect_L1, pts_t0)
 
-        if len(p0_tracked) < 6:
-            n_skipped_points += 1
+        if len(p0_list) < 6:
+            n_skip_pts += 1
             continue
 
-        # ── ADIM 3: PnP odometry ─────────────────────────────────────────
-        # p0_tracked noktalarına karşılık gelen 3D noktaları bul
-        # (pts_t0 ile p0_tracked aynı sırada değil; eşleştir)
-        p0_arr = np.array(p0_tracked)
-        pt_arr = pts_t0.reshape(-1, 2)
+        # --- ADIM 4: 3D-2D nokta eslestir ---
+        # pts_t0 ile p0_list ayni sirayla uretildi (LK flow girdi noktalarini
+        # aynen korur, sadece st==1 olanlar kalir)
+        # Eslestirme: p0_list icindeki her nokta icin pts_t0'daki en yakin noktayi bul
+        p0_arr  = np.array(p0_list,  dtype=np.float32)
+        pts_arr = pts_t0.reshape(-1, 2)
 
-        matched_3d = []
-        matched_2d = []
-        for k, p0 in enumerate(p0_arr):
-            dists = np.linalg.norm(pt_arr - p0, axis=1)
-            idx   = np.argmin(dists)
-            if dists[idx] < 1.5:   # 1.5 piksel tolerans
+        matched_3d, matched_2d = [], []
+        for k in range(len(p0_arr)):
+            dists = np.linalg.norm(pts_arr - p0_arr[k], axis=1)
+            idx   = int(np.argmin(dists))
+            if dists[idx] < 1.5:
                 matched_3d.append(pts_3d_t0[idx])
-                matched_2d.append(p1_tracked[k])
+                matched_2d.append(p1_list[k])
 
         if len(matched_3d) < 6:
-            n_skipped_points += 1
+            n_skip_pts += 1
             continue
 
+        # --- ADIM 5: PnP odometry ---
         rvec, tvec, inliers = tracker.calculate_odometry(
-            np.array(matched_3d), np.array(matched_2d)
+            np.array(matched_3d, dtype=np.float32),
+            np.array(matched_2d, dtype=np.float32)
         )
 
         if tvec is None:
             continue
 
-        # ── ADIM 4: IMU füzyonu + hız hesabı ─────────────────────────────
-        _, _, imu_delta_p = tracker.imu.get_prediction()
-
+        # --- ADIM 6: IMU fuzyon ---
+        _, _, imu_dp = tracker.imu.get_prediction()
         if imu_fused:
-            tvec = tracker.fuse_imu_vision(tvec, imu_delta_p, len(inliers))
+            tvec = tracker.fuse_imu_vision(tvec, imu_dp, len(inliers))
 
-        speed = np.linalg.norm(tvec) / dt
-
-        # ── DÜZELTME 5: Fiziksel kısıt (drone için 4 m/s yeterli) ────────
+        speed = float(np.linalg.norm(tvec)) / dt
         if speed > 4.0:
-            n_skipped_speed += 1
+            n_skip_speed += 1
             continue
 
         n_success += 1
-        log_file.write(
-            f"{ts_t1_ns},"
-            f"{tvec[0][0]:.6f},{tvec[1][0]:.6f},{tvec[2][0]:.6f},"
-            f"{speed:.4f},{len(inliers)},{int(imu_fused)}\n"
-        )
+        tx, ty, tz = float(tvec[0]), float(tvec[1]), float(tvec[2])
+        log.write(f"{ts_t1},{tx:.6f},{ty:.6f},{tz:.6f},{speed:.4f},{len(inliers)},{int(imu_fused)}\n")
 
-        # ── Görselleştirme ───────────────────────────────────────────────
-        display = cv2.cvtColor(rect_l_t1_direct, cv2.COLOR_GRAY2BGR)
-
-        for pt in p1_tracked:
+        # --- Gorsellestirme ---
+        display = cv2.cvtColor(rect_L1, cv2.COLOR_GRAY2BGR)
+        for pt in p1_list:
             cv2.circle(display, (int(pt[0]), int(pt[1])), 3, (0, 255, 0), -1)
-
-        # İnlier noktaları kırmızı ile işaretle
         if inliers is not None:
             for idx in inliers.ravel():
                 if idx < len(matched_2d):
                     pt = matched_2d[idx]
-                    cv2.circle(display, (int(pt[0]), int(pt[1])), 5, (0, 0, 255), 1)
+                    cv2.circle(display, (int(pt[0]), int(pt[1])), 6, (0, 0, 255), 1)
 
-        cv2.putText(display,
-            f"Frame: {i+1}/{len(left_images)}",
-            (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-        cv2.putText(display,
-            f"Speed: {speed:.3f} m/s",
-            (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 100, 255), 2)
-        cv2.putText(display,
-            f"Inliers: {len(inliers)}  |  Pts: {len(matched_3d)}",
-            (10, 79), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 100, 0), 2)
-        cv2.putText(display,
-            f"IMU: {'ON' if imu_fused else 'OFF'}",
-            (10, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-            (0, 255, 0) if imu_fused else (100, 100, 100), 2)
-        cv2.putText(display,
-            f"tx={tvec[0][0]:.3f} ty={tvec[1][0]:.3f} tz={tvec[2][0]:.3f}",
-            (10, 133), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+        cv2.putText(display, f"Frame {i+1}/{len(left_images)}",
+                    (10, 25),  cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,255), 2)
+        cv2.putText(display, f"Speed: {speed:.3f} m/s",
+                    (10, 52),  cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,100,255), 2)
+        cv2.putText(display, f"Inliers: {len(inliers)}  Pts: {len(matched_3d)}",
+                    (10, 79),  cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,100,0), 2)
+        cv2.putText(display, f"IMU: {'ON' if imu_fused else 'OFF'}",
+                    (10, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                    (0,255,0) if imu_fused else (120,120,120), 2)
+        cv2.putText(display, f"tx={tx:.3f} ty={ty:.3f} tz={tz:.3f}",
+                    (10, 133), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
 
-        cv2.imshow("VIO — Stereo + IMU", display)
+        cv2.imshow("VIO - Stereo + IMU", display)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # ── Özet ─────────────────────────────────────────────────────────────
-    log_file.close()
+    log.close()
     cv2.destroyAllWindows()
 
-    print("\n" + "="*55)
-    print(f"  Toplam kare        : {n_total}")
-    print(f"  Başarılı tahmin    : {n_success}")
-    print(f"  Hız filtresi çıktı : {n_skipped_speed}")
-    print(f"  Nokta yetersiz     : {n_skipped_points}")
-    print(f"  Başarı oranı       : {100*n_success/max(n_total,1):.1f}%")
-    print("="*55)
-    print("  'estimated_trajectory.csv' oluşturuldu.")
-    print("="*55)
+    print("\n" + "="*50)
+    print(f"  Toplam kare       : {n_total}")
+    print(f"  Basarili tahmin   : {n_success}")
+    print(f"  Nokta yetersiz    : {n_skip_pts}")
+    print(f"  Hiz filtresi      : {n_skip_speed}")
+    print(f"  Basari orani      : {100*n_success/max(n_total,1):.1f}%")
+    print("="*50)
+    print("  'estimated_trajectory.csv' olusturuldu.")
+    print("="*50)
 
 
 if __name__ == "__main__":
