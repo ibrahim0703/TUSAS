@@ -1,40 +1,41 @@
-# --- KONTROLCÜLERİ YARAT ---
-# Dış Döngü (Konum -> Hedef Açıyı Üretir). Çıkış limiti radyan cinsinden maks eğilme (örn: 0.5 rad)
-pid_x_pos = PIDController(Kp=0.8, Ki=0.0, Kd=1.2, output_limit=0.5) 
+import time
 
-# İç Döngü (Açı -> Motor Torkunu Üretir). Çıkış limiti Newton-metre cinsinden maks Tork
-pid_pitch_att = PIDController(Kp=5.0, Ki=0.0, Kd=2.1, output_limit=2.0)
+# ... (PID Sınıfı ve değişken tanımlamaları aynı kalacak) ...
 
-# Simülasyon Zaman Ayarları
-dt_inner = 0.002 # 500 Hz (İç döngü refleks hızı)
-dt_outer = 0.02  # 50 Hz (Dış döngü karar hızı)
-outer_loop_counter = 0
+# Simülasyon ömrü: Sadece 3 saniye çalışsın
+sim_time = 0.0
+max_sim_time = 3.0 
 
-# Hedeflerimiz
-target_x = 5.0 # Metre
+print("Simülasyon Başlıyor...\n")
+print(f"{'ZAMAN (s)':<10} | {'HEDEF X':<10} | {'GÜNCEL X':<10} | {'HEDEF PITCH':<15} | {'ÜRETİLEN TORK':<15}")
+print("-" * 75)
 
-# Anlık Durumlar (Gerçek simülasyonda bunları fizik motorundan / sensörden okuyacaksın)
-current_x = 0.0
-current_pitch = 0.0
-target_pitch = 0.0 
-
-# --- ANA SİMÜLASYON DÖNGÜSÜ ---
-while True:
-    # 1. DIŞ DÖNGÜ (Daha yavaş çalışır. Her 10 iç döngüde 1 kez tetiklenir)
+while sim_time < max_sim_time:
+    # 1. DIŞ DÖNGÜ (50 Hz)
     if outer_loop_counter >= (dt_outer / dt_inner):
-        # Konumdaki hataya bak, ne kadar eğilmemiz gerektiğine (Pitch) karar ver
-        # Dikkat: X'te ileri gitmek için Pitch'i eksi (veya artı) yapmak gerekebilir, bu referans sistemine bağlıdır.
         target_pitch = pid_x_pos.update(target_x, current_x, dt_outer)
-        outer_loop_counter = 0 # Sayacı sıfırla
+        outer_loop_counter = 0
         
-    # 2. İÇ DÖNGÜ (Her milisaniye çalışır. Dış döngüden gelen target_pitch'i hedefler)
-    # Pitch hatasını ezmek için fiziksel olarak ne kadar Tork (bükme gücü) lazım?
+    # 2. İÇ DÖNGÜ (500 Hz)
     torque_y = pid_pitch_att.update(target_pitch, current_pitch, dt_inner)
     
-    # 3. KASLARA GÜÇ VER (Mixer ve Fizik Motoru)
-    # Elde edilen torque_y, mikser matrisinden geçip motor RPM'lerine dönüşür
-    # update_physics_engine(torque_y, dt_inner) ...
+    # 3. FİZİKSEL GERÇEKLİK SİMÜLASYONU (Basit Kütle Modeli)
+    # Tork -> Pitch açısını değiştirir (Basit ivmelenme)
+    # Pitch -> X konumunu değiştirir (Basit kinematik)
+    # Not: Gerçekte buraya fizik motoru formülleri gelir. Şimdilik torkun x'i değiştirdiğini farz edelim:
+    current_pitch += torque_y * 0.01 
+    current_x += current_pitch * 0.05 
+    
+    # Her 50 iç döngüde bir (0.1 saniyede bir) ekrana yazdır ki terminal kilitlenmesin
+    if int(sim_time * 1000) % 100 == 0:
+        print(f"{sim_time:<10.3f} | {target_x:<10.1f} | {current_x:<10.3f} | {target_pitch:<15.3f} | {torque_y:<15.3f}")
     
     # Zamanı ilerlet
     outer_loop_counter += 1
-    # sleep(dt_inner) # Gerçek zamanlı çalışıyorsa
+    sim_time += dt_inner
+    
+    # Gerçek zamanlı akmasını istiyorsan aşağıdaki sleep'i aç. 
+    # Hızlıca bitip sonucu görmek istiyorsan kapalı kalsın.
+    # time.sleep(dt_inner) 
+
+print("\nSimülasyon Bitti.")
